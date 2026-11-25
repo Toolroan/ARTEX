@@ -331,6 +331,42 @@ export interface CoverageAssetRefs {
   findings: CoverageAssetRef[];
 }
 
+// ---- Curated task artifacts ----
+export type ArtifactCategory = "database" | "source" | "config" | "document" | "evidence" | "other";
+export interface CollectedArtifact {
+  id: string;
+  name: string;
+  category: ArtifactCategory;
+  source: string;
+  description?: string;
+  size: number;
+  sha256: string;
+  created_at: number; // unix millis
+  worker: string;
+  intent_id: number;
+  original_path: string; // task-relative provenance, not a download location
+}
+export interface CollectedArtifactListing {
+  items: CollectedArtifact[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+export interface CollectedArtifactPreview {
+  id: string;
+  name: string;
+  size: number;
+  binary: boolean;
+  too_large?: boolean;
+  content?: string;
+}
+export interface CollectArtifactInput {
+  path: string;
+  category: ArtifactCategory;
+  source: string;
+  description?: string;
+}
+
 // ---- Workspace file manager (workDir) ----
 export interface WorkspaceEntry {
   name: string;
@@ -1449,7 +1485,6 @@ export type TaskCredential = TaskCredentialInput & {
   created_at: string;
   updated_at: string;
 };
-
 
 export interface AssetInterceptRule {
   id: number;

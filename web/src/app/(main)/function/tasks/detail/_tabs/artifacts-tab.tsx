@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { DownloadIcon, FileIcon, FolderIcon, KeyRoundIcon, RefreshCwIcon, SearchIcon } from "lucide-react";
+import { ArchiveIcon, DownloadIcon, FileIcon, FolderIcon, KeyRoundIcon, RefreshCwIcon, SearchIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -24,6 +24,9 @@ import {
 } from "@/lib/task-artifacts";
 import type { WorkspaceEntry, WorkspaceFile } from "@/lib/types";
 
+import { ArtifactCollectForm } from "./artifact-collect-form";
+import { CollectedArtifacts } from "./collected-artifacts";
+
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
@@ -39,8 +42,74 @@ type Preview = {
 };
 
 export function ArtifactsTab({ taskId, onOpenCredentials }: { taskId: string; onOpenCredentials: () => void }) {
+  const [source, setSource] = React.useState<"collected" | "files" | "output">("collected");
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="font-semibold text-base">{t("Artifacts")}</h2>
+          <p className="mt-1 max-w-2xl text-muted-foreground text-sm">
+            {t("Collected files in one place, with their source and download details.")}
+          </p>
+        </div>
+        <Button size="sm" variant="outline" onClick={onOpenCredentials}>
+          <KeyRoundIcon />
+          {t("Credentials")}
+        </Button>
+      </div>
+      <fieldset className="flex flex-wrap gap-1 border-b pb-3" aria-label={t("Artifact location")}>
+        <Button
+          size="sm"
+          variant={source === "collected" ? "secondary" : "ghost"}
+          aria-pressed={source === "collected"}
+          onClick={() => setSource("collected")}
+        >
+          <ArchiveIcon />
+          {t("Collected artifacts")}
+        </Button>
+        <Button
+          size="sm"
+          variant={source === "files" ? "secondary" : "ghost"}
+          aria-pressed={source === "files"}
+          onClick={() => setSource("files")}
+        >
+          <FolderIcon />
+          {t("Workspace files")}
+        </Button>
+        <Button
+          size="sm"
+          variant={source === "output" ? "secondary" : "ghost"}
+          aria-pressed={source === "output"}
+          onClick={() => setSource("output")}
+        >
+          <FileIcon />
+          {t("Saved tool output")}
+        </Button>
+      </fieldset>
+      {source === "collected" ? (
+        <CollectedArtifacts key={taskId} taskId={taskId} onOpenWorkspace={() => setSource("files")} />
+      ) : (
+        <WorkspaceArtifactBrowser
+          key={`${taskId}-${source}`}
+          taskId={taskId}
+          source={source}
+          onCollected={() => setSource("collected")}
+        />
+      )}
+    </div>
+  );
+}
+
+function WorkspaceArtifactBrowser({
+  taskId,
+  source,
+  onCollected,
+}: {
+  taskId: string;
+  source: "files" | "output";
+  onCollected: () => void;
+}) {
   const roots = taskArtifactRoots(taskId);
-  const [source, setSource] = React.useState<"files" | "output">("files");
   const root = roots?.[source] ?? "";
   const [path, setPath] = React.useState(root);
   const [entries, setEntries] = React.useState<WorkspaceEntry[]>([]);
@@ -131,7 +200,7 @@ export function ArtifactsTab({ taskId, onOpenCredentials }: { taskId: string; on
 
   const visibleEntries = entries.filter((entry) => entry.name.toLocaleLowerCase().includes(filter.toLocaleLowerCase()));
   const crumbs = artifactBreadcrumbs(root, path);
-  const rootLabel = source === "files" ? t("Task files") : t("Saved tool output");
+  const rootLabel = source === "files" ? t("Workspace files") : t("Saved tool output");
   const previewHref = preview ? artifactDownloadHref(root, preview.entry.path) : undefined;
   let emptyMessage = t("Empty directory");
   if (loading) emptyMessage = t("Loading…");
@@ -140,40 +209,12 @@ export function ArtifactsTab({ taskId, onOpenCredentials }: { taskId: string; on
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="font-semibold text-base">{t("Artifacts")}</h2>
-          <p className="mt-1 text-muted-foreground text-sm">
-            {t("Browse and download files saved by this task, including exports, dumps, and evidence.")}
-          </p>
-        </div>
-        <Button size="sm" variant="outline" onClick={onOpenCredentials}>
-          <KeyRoundIcon />
-          {t("Credentials")}
-        </Button>
-      </div>
-
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <fieldset className="flex gap-1" aria-label={t("Artifact location")}>
-          <Button
-            size="sm"
-            variant={source === "files" ? "secondary" : "ghost"}
-            aria-pressed={source === "files"}
-            onClick={() => setSource("files")}
-          >
-            <FolderIcon />
-            {t("Task files")}
-          </Button>
-          <Button
-            size="sm"
-            variant={source === "output" ? "secondary" : "ghost"}
-            aria-pressed={source === "output"}
-            onClick={() => setSource("output")}
-          >
-            <FileIcon />
-            {t("Saved tool output")}
-          </Button>
-        </fieldset>
+        <p className="text-muted-foreground text-sm">
+          {source === "files"
+            ? t("Scripts, working files, and uploads. Add selected files to the collected library when ready.")
+            : t("Raw output saved by tools during this task.")}
+        </p>
         <Button variant="outline" size="sm" disabled={loading} onClick={() => void load(path)}>
           {loading ? <Spinner /> : <RefreshCwIcon />}
           {t("Refresh")}
@@ -320,6 +361,14 @@ export function ArtifactsTab({ taskId, onOpenCredentials }: { taskId: string; on
                   </a>
                 </Button>
               </div>
+              {source === "files" && (
+                <ArtifactCollectForm
+                  key={preview.entry.path}
+                  taskId={taskId}
+                  path={preview.entry.path}
+                  onCollected={onCollected}
+                />
+              )}
               {preview.loading && (
                 <div
                   className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-sm"

@@ -42,6 +42,10 @@ import type {
   BatchCategoryItem,
   BatchControlItem,
   ChatAttachment,
+  CollectArtifactInput,
+  CollectedArtifact,
+  CollectedArtifactListing,
+  CollectedArtifactPreview,
   CommandRecord,
   Company,
   CompanyScopeMutation,
@@ -508,6 +512,16 @@ export const api = {
   deleteTaskScope: (id: string, scopeId: number) => del<{ ok: boolean }>(`/tasks/${id}/scope/${scopeId}`),
   // Intents / facts / findings of an asset within this task (for the coverage graph node drawer).
   taskAssetRefs: (id: string, assetId: number) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
+
+  // ---- curated task artifacts ----
+  taskArtifacts: (id: string, query: string) =>
+    get<CollectedArtifactListing>(`/tasks/${encodeURIComponent(id)}/artifacts?${query}`),
+  collectTaskArtifact: (id: string, input: CollectArtifactInput) =>
+    post<CollectedArtifact>(`/tasks/${encodeURIComponent(id)}/artifacts`, input),
+  taskArtifactPreview: (id: string, artifactId: string) =>
+    get<CollectedArtifactPreview>(
+      `/tasks/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifactId)}/preview`,
+    ),
 
   // ---- workspace file manager (workDir) ----
   workspaceList: (path = "") => get<WorkspaceListing>(`/workspace/list?path=${encodeURIComponent(path)}`),

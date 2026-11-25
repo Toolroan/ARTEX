@@ -3,6 +3,7 @@
 // Only entered via the http() short-circuit in api.ts when NEXT_PUBLIC_MOCK=1.
 
 import type { PlannerDelivery } from "../api";
+import { ARTIFACT_CATEGORIES } from "../collected-artifacts";
 import {
   classifyCompanyScopeLine,
   companyScopeRuleError,
@@ -12,8 +13,11 @@ import {
 import type {
   Activity,
   ArchiveBatchItem,
+  ArtifactCategory,
   Asset,
   BatchControlItem,
+  CollectedArtifact,
+  CollectedArtifactPreview,
   Company,
   CompanyScopeRule,
   Conversation,
@@ -34,6 +38,7 @@ import type {
   TrafficEvidenceRole,
   TrafficEvidenceSnapshot,
 } from "../types";
+import { artifactFixtures, artifactPreviewFixtures } from "./artifact-fixtures";
 import * as D from "./data";
 
 const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
@@ -44,6 +49,10 @@ const mockInterceptHistory = structuredClone(D.interceptHistory);
 const mockInterceptPending = structuredClone(D.interceptPending);
 const mockInterceptDetails = structuredClone(D.interceptDetails);
 const mockTasks = structuredClone(D.tasks);
+const mockCollectedArtifacts: Record<string, CollectedArtifact[]> = { "t-acme-web": structuredClone(artifactFixtures) };
+const mockArtifactPreviews: Record<string, Record<string, CollectedArtifactPreview>> = {
+  "t-acme-web": structuredClone(artifactPreviewFixtures),
+};
 const mockFindings = structuredClone(D.findings);
 const mockLLMRecords = structuredClone(D.llmRecords);
 const mockTaskTemplates = structuredClone(D.taskTemplates);
@@ -1723,6 +1732,79 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
         },
       ],
     };
+
+  // ── Collected artifacts: synthetic metadata, explicit previews, task isolation ──
+  if (seg[0] === "tasks" && seg[2] === "artifacts") {
+    const taskId = decodeURIComponent(seg[1]);
+    const items = mockCollectedArtifacts[taskId] ?? [];
+    if (seg.length === 3 && m === "GET") {
+      const category = q.get("category") ?? "";
+      const search = (q.get("q") ?? "").trim().toLowerCase();
+      const matches = items.filter(
+        (item) =>
+          (!category || item.category === category) &&
+          (!search ||
+            [item.name, item.source, item.description ?? ""].some((value) => value.toLowerCase().includes(search))),
+      );
+      const limit = Math.max(1, Math.min(500, Number(q.get("limit")) || 100));
+      const offset = Math.max(0, Number(q.get("offset")) || 0);
+      return { items: matches.slice(offset, offset + limit), total: matches.length, limit, offset };
+    }
+    if (seg.length === 5 && seg[4] === "preview" && m === "GET") {
+      const preview = mockArtifactPreviews[taskId]?.[seg[3]];
+      if (!preview) throw new Error("artifact not found");
+      return preview;
+    }
+    if (seg.length === 3 && m === "POST") {
+      const path = String(b.path ?? "");
+      const category = String(b.category ?? "") as ArtifactCategory;
+      const source = String(b.source ?? "").trim();
+      const description = String(b.description ?? "").trim();
+      if (
+        !path.startsWith(`tasks/${taskId}/`) ||
+        path.split("/").some((part) => !part || part === "." || part === "..") ||
+        !ARTIFACT_CATEGORIES.includes(category)
+      )
+        throw new Error("invalid artifact input");
+      const originalPath = path.slice(`tasks/${taskId}/`.length);
+      const existing = items.find(
+        (item) =>
+          item.original_path === originalPath &&
+          item.category === category &&
+          item.source === source &&
+          item.description === description,
+      );
+      if (existing) return existing;
+      const file = D.workspaceRead(path);
+      const id = (1000 + Object.values(mockCollectedArtifacts).reduce((total, list) => total + list.length, 0))
+        .toString(16)
+        .padStart(64, "0");
+      const entry: CollectedArtifact = {
+        id,
+        name: path.split("/").at(-1) ?? "artifact",
+        category,
+        source,
+        description,
+        size: file.size,
+        sha256: "e".repeat(64),
+        created_at: Date.now(),
+        worker: "operator",
+        intent_id: 0,
+        original_path: originalPath,
+      };
+      mockCollectedArtifacts[taskId] = [entry, ...items];
+      mockArtifactPreviews[taskId] ??= {};
+      mockArtifactPreviews[taskId][id] = {
+        id,
+        name: entry.name,
+        size: file.size,
+        binary: file.binary,
+        too_large: file.too_large,
+        content: file.content,
+      };
+      return entry;
+    }
+  }
 
   // ── Workspace file manager (demo: static sample tree; writes/creates/deletes hit the {ok:true} write fallback below) ──
   if (path === "/workspace/list") return D.workspaceList(q.get("path") ?? "");

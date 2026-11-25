@@ -37,7 +37,7 @@ func mainAdministrativeTool(name string) bool {
 
 func mainReadTool(name string) bool {
 	switch name {
-	case "graph_overview", "list_findings", "list_facts", "node_detail", "expand_digest", "get_worker_output", "get_worker_trace", "search_all_worker_traces", "list_assets", "list_untested_assets", "list_hints", "get_main_conversation":
+	case "graph_overview", "list_findings", "list_facts", "node_detail", "expand_digest", "get_worker_output", "get_worker_trace", "search_all_worker_traces", "list_assets", "list_untested_assets", "list_hints", "get_main_conversation", "list_artifacts":
 		return true
 	}
 	return false

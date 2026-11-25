@@ -30,7 +30,7 @@ func mainAgentOrchestrationTools(t *ToolSet) []actool.CoreTool {
 	return t.DropCoverageTools([]actool.CoreTool{
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
 		t.expandDigest(), t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(),
-		t.listAssets(), t.listUntestedAssets(), t.listHints(),
+		t.listAssets(), t.listUntestedAssets(), t.listHints(), t.listArtifacts(),
 		hints.addHint(), t.addIntent(), t.setGoals(), t.setConstraints(),
 		t.addTaskScope(), t.addCompanyScope(),
 	})
@@ -45,7 +45,8 @@ func mainAgentTurnReminder(mainDir string) string {
 	return fmt.Sprintf("[Current Main capabilities and delegation]\n"+
 		"Bash, file-execution and network tools are intentionally unavailable to Main. Historical tool calls/results are evidence from an earlier role, not current capabilities or proof of a fresh check. Use the current tool schemas; do not diagnose an outage or stop merely because an execution tool is absent.\n"+
 		"Use verified existing evidence when it answers the question. Saved conversation context is not a Planner instruction: follow the current routing receipt and tool policy. Actions/corrections owned by Planner must not be dispatched again by Main. For a server-assigned main_oneoff request only, check matching work and use add_intent if exposed for the requested bounded analysis. The user need not say \"worker\" to request analysis. For questions, pending routes and ambiguity remain read-only and clarify as needed; do not create a new hint to bypass routing. Queued/reviewed does not mean executed. Do not invent goals, targets, scope or lifecycle changes.\n"+
-		"Task artifact root: %q\nMain working directory: %q\nMain uploads directory: %q\n"+
+		"Use list_artifacts for the curated Collected artifacts library. Workers publish completed local files with save_artifact; helper scripts and scratch files stay in their workspace. Do not claim a file is collected without a saved artifact record. The operator can use Add to collected in Workspace files for an existing file.\n"+
+		"Task workspace root: %q\nMain working directory: %q\nMain uploads directory: %q\n"+
 		"Workers have their own working directories. In a handoff, provide the relevant full absolute file paths, requested calculation/check, necessary conversation context, and expected result; do not send only relative filenames. Retain the existing scope and task constraints. If delegation is unavailable or waiting, report that specific state; distinguish historical figures from newly verified results.",
 		filepath.Dir(mainDir), mainDir, filepath.Join(mainDir, "uploads"))
 }

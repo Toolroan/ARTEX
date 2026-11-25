@@ -114,6 +114,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		tsx.SetAssetStore(as, as.Companies())
 	}
 	tsx.SetTaskID(taskID)
+	tsx.SetWorkBase(m.workDir)
 	tsx.SetCoverageEnabled(coverageOn(as, taskID))
 	tsx.SetNotify(notify)         // generic wake-up (write ops without a dedicated callback go through it, debounced)
 	tsx.SetResumeTask(resume)     // set_goals adds a goal → pull a completed/paused task back to running

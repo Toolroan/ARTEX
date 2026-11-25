@@ -683,6 +683,7 @@ func splitLines(s string) []string {
 // WorkerTools returns the tool set for a work agent.
 func (t *ToolSet) WorkerTools() []actool.CoreTool {
 	return []actool.CoreTool{
+		t.saveArtifact(), t.listArtifacts(),
 		// list_findings stays: check the task's confirmed findings before reporting, to
 		// avoid reporting the same finding twice.
 		t.listFindings(),
@@ -721,6 +722,7 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 // MainAgentTools returns the human-interface tool set.
 func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 	return []actool.CoreTool{
+		t.listArtifacts(),
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
 		t.expandDigest(), // cold-digest §6.1
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.addHint(), t.addIntent(),

@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/artifacts"
 )
 
 // Environment names the shims read. They carry no secret: the executor id, the real
@@ -476,7 +477,11 @@ func shareTaskDir(taskDir string, gid int) error {
 	}
 	for _, e := range entries {
 		path := filepath.Join(taskDir, e.Name())
-		if !agent.IsRunDirName(e.Name()) {
+		if e.Name() == artifacts.Directory {
+			// Collected snapshots are service-owned records, not legacy workspace
+			// files. Repair their permissions after startup and archive restore.
+			err = artifacts.ProtectTaskStore(taskDir)
+		} else if !agent.IsRunDirName(e.Name()) {
 			err = shareWithExecGroup(path, gid)
 		} else if e.IsDir() {
 			err = shareRunDir(path, gid)

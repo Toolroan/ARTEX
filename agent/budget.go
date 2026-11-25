@@ -228,11 +228,11 @@ func (m *IntentMeter) Finish() {
 // BudgetWrapupBlocks reports whether a worker tool is refused once its budget is
 // exhausted: all but the write-back tools, so the run records facts and stops.
 func BudgetWrapupBlocks(tool string) bool {
-	return tool != "record_fact" && tool != "insert_assets" && tool != "report_finding" && tool != "update_finding_report" && tool != "record_coverage"
+	return tool != "record_fact" && tool != "insert_assets" && tool != "report_finding" && tool != "update_finding_report" && tool != "record_coverage" && tool != "save_artifact"
 }
 
 // WorkerBudgetWrapup is returned in place of a refused tool call.
-const WorkerBudgetWrapup = "[Budget reached] This intent's token/turn budget is used up; the tool call was not executed. Do not run any more commands or probes. Write back what you identified but have not persisted yet (insert_assets, record_fact, report_finding), then, in a single standalone sentence of plain text, summarize what you did and your key conclusions."
+const WorkerBudgetWrapup = "[Budget reached] This intent's token/turn budget is used up; the tool call was not executed. Do not run any more commands or probes. Write back what you identified but have not persisted yet (insert_assets, record_fact, report_finding), publish completed collected files with save_artifact, then, in a single standalone sentence of plain text, summarize what you did and your key conclusions."
 
 const plannerBudgetWrapup = "**The task's token/turn budget is exhausted and the task is about to end** (a normal end, not an error). Based on the current facts and findings, make the final goal judgment: call prove_goal for goals proven met by evidence. **Do not generate any new intents** (they will not be executed). Then, in a single standalone sentence of plain text, summarize where the task stands."
 

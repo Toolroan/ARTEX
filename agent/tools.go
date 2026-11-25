@@ -232,26 +232,27 @@ type EnrichTrigger interface {
 	ProbeSite(ctx context.Context, id int64, url string)
 }
 
-// WriteCounts breaks down what a worker persisted this run, by node kind, so the
+// WriteCounts breaks down what a worker persisted this run, so the
 // engine can log an accurate "wrote back" summary instead of lumping assets and
 // findings under "facts" (record_fact → Facts, insert_assets → Assets,
-// report_finding → Findings; each element of a batch counts once).
+// report_finding → Findings, save_artifact → Artifacts).
 type WriteCounts struct {
-	Facts    int
-	Assets   int
-	Findings int
+	Facts     int
+	Assets    int
+	Findings  int
+	Artifacts int
 }
 
-// Total is every node persisted this run, regardless of kind — the
+// Total counts persisted graph records and artifact snapshots — the
 // "explored but persisted nothing" signal (Total == 0).
-func (w WriteCounts) Total() int { return w.Facts + w.Assets + w.Findings }
+func (w WriteCounts) Total() int { return w.Facts + w.Assets + w.Findings + w.Artifacts }
 
 // String renders the per-kind breakdown for logs, e.g. "facts=1 assets=25 findings=0".
 func (w WriteCounts) String() string {
-	return fmt.Sprintf("facts=%d assets=%d findings=%d", w.Facts, w.Assets, w.Findings)
+	return fmt.Sprintf("facts=%d assets=%d findings=%d artifacts=%d", w.Facts, w.Assets, w.Findings, w.Artifacts)
 }
 
-// Writes reports what this run wrote back, split by node kind (so the engine can
+// Writes reports what this run wrote back, split by kind (so the engine can
 // tell "explored but persisted nothing" apart from a completed intent, and log an
 // honest breakdown instead of calling assets/findings "facts").
 func (t *ToolSet) Writes() WriteCounts { return t.writes }
@@ -2477,6 +2478,7 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 // PlannerTools is the read + intent-generation + goal-judgement tool set.
 func (t *ToolSet) PlannerTools() []actool.CoreTool {
 	return []actool.CoreTool{
+		t.listArtifacts(),
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.listHints(), t.nodeDetail(),
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
