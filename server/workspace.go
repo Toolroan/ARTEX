@@ -62,6 +62,11 @@ func workspacePathDenied(realRoot, realPath string) bool {
 		segs[i] = strings.ToLower(strings.TrimRight(seg, ". "))
 	}
 	rel = strings.Join(segs, "/")
+	// Curated snapshots have their own task-scoped API. Generic workspace
+	// editing must never alter their metadata or immutable contents.
+	if len(segs) >= 3 && segs[0] == "tasks" && segs[2] == "collected" {
+		return true
+	}
 	for _, prefix := range workspaceDeniedPrefixes {
 		if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
 			return true
@@ -83,6 +88,10 @@ func workspaceHoldsDenied(realRoot, path string) bool {
 		segs[i] = strings.ToLower(strings.TrimRight(seg, ". "))
 	}
 	rel = strings.Join(segs, "/")
+	// Task lifecycle controls own removal of task trees and collected snapshots.
+	if rel == "tasks" || (len(segs) == 2 && segs[0] == "tasks") {
+		return true
+	}
 	for _, prefix := range workspaceDeniedPrefixes {
 		if strings.HasPrefix(prefix, rel+"/") {
 			return true
@@ -136,6 +145,9 @@ func (s *Server) wsList(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]wsEntry, 0, len(ents))
 	for _, e := range ents {
+		if workspacePathDenied(cp.realRoot, filepath.Join(abs, e.Name())) {
+			continue
+		}
 		info, err := e.Info()
 		if err != nil {
 			continue
