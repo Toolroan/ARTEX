@@ -7,6 +7,12 @@ import { t } from "@/i18n";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
+
+export type PlannerDelivery = {
+  hint_id: number;
+  delivery: "notified" | "saved";
+  reason?: string;
+};
 import type {
   ActiveFindingRetest,
   Activity,
@@ -405,6 +411,8 @@ export const api = {
       accepted: true;
       request_id: string;
     }>(`/tasks/${taskId}/intents/${intentId}/messages`, { message, request_id: requestId }),
+  sendPlannerInstruction: (taskId: string, text: string) =>
+    post<PlannerDelivery>(`/tasks/${taskId}/planner-instructions`, { text }),
   taskLLMResolution: (id: string) => get<TaskLLMResolutions>(`/tasks/${id}/llm/resolution`),
   // Rerun an intent that did not succeed (blocked/exhausted/stopped): set back to open, and a worker re-claims and reruns it from scratch.
   rerunIntent: (taskId: string, intentId: string) =>
@@ -732,7 +740,13 @@ export const api = {
   // Save a vulnerability's name/class/severity in one call (inline edit in the findings list); only present fields are sent.
   updateFinding: (
     id: string,
-    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus; report_state?: FindingReportState },
+    fields: {
+      name?: string;
+      vulnclass?: string;
+      severity?: Severity;
+      status?: FindingStatus;
+      report_state?: FindingReportState;
+    },
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // Delete a vulnerability: removes the findings record + the source exploration node (gone from the findings list, the task findings tab, and the exploration graph together).
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
@@ -999,8 +1013,7 @@ export const api = {
   // Channels are multi-instance resources (several bots of the same kind, each with its own
   // filter rules), so they form their own group instead of the flat settings key/value store.
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -1052,7 +1065,11 @@ export const api = {
       { signal },
     ),
   chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number) =>
-    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg }),
+    post<{ reply: string; mode: string; planner_delivery?: PlannerDelivery }>(`/chat${tq(task)}`, {
+      message,
+      attachments,
+      seg,
+    }),
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
   // Option 1, file upload: lands in the session/task working directory uploads/, returning a relative path the agent can Read.
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {
@@ -1278,8 +1295,12 @@ export const api = {
     t: Pick<Tool, "description" | "schema" | "agents" | "enabled" | "kind" | "exec" | "deferred">,
   ) => put<{ ok: boolean }>(`/tools/custom/${key}`, t),
   deleteCustomTool: (key: string) => del<{ deleted: string }>(`/tools/custom/${key}`),
-  testCustomTool: (body: { key?: string; kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
-    post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
+  testCustomTool: (body: {
+    key?: string;
+    kind: string;
+    exec: Record<string, unknown>;
+    params: Record<string, unknown>;
+  }) => post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
   detectPython: () => post<{ python_interpreter: string }>("/settings/python/detect", {}),
 
   // ---- mcp ----

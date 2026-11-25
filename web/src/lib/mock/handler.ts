@@ -50,6 +50,7 @@ const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
+let mockPlannerInstructionId = 10000;
 
 // ── related traffic evidence (finding traffic) ─────────────────────────────────────────────
 // The backend stores request/response snapshots in a separate evidence table; the frontend detail page renders them with FindingTrafficPanel.
@@ -66,7 +67,9 @@ interface MockBindingSeed {
 // Preset traffic evidence per finding (finding id → bound captures). Requests are chosen to match the finding semantics,
 // so the "Related traffic" section of the demo detail page looks realistic.
 const mockFindingTrafficSeeds: Record<string, MockBindingSeed[]> = {
-  "f-1": [{ traffic_id: "x-2", role: "proof", note: "q parameter injection payload; the response echoes the MSSQL error." }],
+  "f-1": [
+    { traffic_id: "x-2", role: "proof", note: "q parameter injection payload; the response echoes the MSSQL error." },
+  ],
   "f-2": [
     { traffic_id: "x-8", role: "baseline", note: "Own order id=1001, as a normal baseline." },
     { traffic_id: "x-9", role: "proof", note: "Changing id=1002 reads another user's order without authorization." },
@@ -178,7 +181,8 @@ function advanceMockRetests() {
     if (Date.now() - Date.parse(retest.created_at) < 15000) continue;
     retest.status = "completed";
     retest.verdict = "inconclusive";
-    retest.summary = "The demo environment did not run real verification, so the finding's current status cannot be confirmed.";
+    retest.summary =
+      "The demo environment did not run real verification, so the finding's current status cannot be confirmed.";
     retest.evidence =
       "### Demo record\n\nLinked to the original finding. This environment has no real Agent connected and sent no requests to the target; run the retest in a real deployment.";
     retest.finished_at = new Date().toISOString();
@@ -275,7 +279,8 @@ function mockArchiveTask(taskID: string): MockTaskArchive {
           (archive.state === "archive_queued" || archive.state === "archiving"),
       ),
   );
-  if (dependent) throw new Error(`The task is directly inherited by unarchived task #${dependent.id} and cannot be archived yet`);
+  if (dependent)
+    throw new Error(`The task is directly inherited by unarchived task #${dependent.id} and cannot be archived yet`);
 
   const numericTaskID = mockArchiveTaskID(taskID);
   const assetIDs = mockAssets.filter((asset) => asset.task_ids.includes(numericTaskID)).map((asset) => asset.id);
@@ -358,7 +363,8 @@ function mockArchiveTask(taskID: string): MockTaskArchive {
 }
 
 function mockRestoreArchive(archive: MockTaskArchive): void {
-  if (archive.state !== "ready" && archive.state !== "restore_failed") throw new Error("the archive's current state cannot be restored");
+  if (archive.state !== "ready" && archive.state !== "restore_failed")
+    throw new Error("the archive's current state cannot be restored");
   archive.state = "restore_queued";
   archive.phase = "Waiting to restore";
   archive.progress = 0;
@@ -392,11 +398,13 @@ function mockRestoreArchive(archive: MockTaskArchive): void {
 }
 
 function mockDeleteArchive(archive: MockTaskArchive): void {
-  if (archive.state !== "ready" && archive.state !== "delete_failed") throw new Error("the archive's current state does not allow permanent deletion");
+  if (archive.state !== "ready" && archive.state !== "delete_failed")
+    throw new Error("the archive's current state does not allow permanent deletion");
   const dependent = mockTaskArchives.find(
     (candidate) => candidate.id !== archive.id && candidate.source_task_ids.includes(archive.task_id),
   );
-  if (dependent) throw new Error(`The archive is still depended on by task #${dependent.task_id} and cannot be permanently deleted`);
+  if (dependent)
+    throw new Error(`The archive is still depended on by task #${dependent.task_id} and cannot be permanently deleted`);
   archive.state = "delete_queued";
   archive.phase = "Waiting for permanent deletion";
   archive.progress = 0;
@@ -1024,7 +1032,12 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
         label: finding.name || finding.vulnclass,
         description: `${finding.severity} · ${finding.summary}`,
       })),
-      ...D.companies.map((company) => ({ kind: "company", id: company.id, label: company.name, description: "company" })),
+      ...D.companies.map((company) => ({
+        kind: "company",
+        id: company.id,
+        label: company.name,
+        description: "company",
+      })),
       ...D.assets.map((asset) => ({
         kind: asset.type,
         id: asset.id,
@@ -1509,6 +1522,16 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   }
   if (seg[0] === "tasks" && seg[2] === "chat" && seg[3] === "status") return { running: false };
   if (seg[0] === "tasks" && seg[2] === "chat" && seg[3] === "stop") return { status: "stopped" };
+  if (seg[0] === "tasks" && seg[2] === "planner-instructions" && m === "POST") {
+    const text = String(b.text ?? "").trim();
+    if (!text || Array.from(text).length > 20000) throw new Error("Invalid Planner instruction");
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    if (!task) throw new Error("task not found");
+    return {
+      hint_id: ++mockPlannerInstructionId,
+      delivery: task.status === "running" && !task.paused ? "notified" : "saved",
+    };
+  }
   if (path === "/active") {
     const id = String(b.id ?? mockActiveTask);
     if (mockTasks.some((item) => item.id === id)) {
@@ -1659,7 +1682,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       const rules: CompanyScopeRule[] = b.scope.map((candidate, index) => {
         if (typeof candidate === "string") {
           const issue = classifyCompanyScopeLine(candidate, index + 1);
-          if (!issue.rule || issue.error) throw new Error(`Scope entry ${index + 1} is invalid: ${issue.error ?? "unrecognized"}`);
+          if (!issue.rule || issue.error)
+            throw new Error(`Scope entry ${index + 1} is invalid: ${issue.error ?? "unrecognized"}`);
           return issue.rule;
         }
         const item = candidate as { kind?: unknown; value?: unknown };
@@ -1739,7 +1763,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     }
     const ids = [...new Set(Array.isArray(b.asset_ids) ? b.asset_ids.map(Number) : [])];
     const sourceSummary = String(b.source_summary ?? "").trim();
-    if (ids.length === 0 || ids.length > 100 || !sourceSummary) throw new Error("select assets and fill in the source note");
+    if (ids.length === 0 || ids.length > 100 || !sourceSummary)
+      throw new Error("select assets and fill in the source note");
     const requestedAssets = ids.map((id) => mockAssets.find((asset) => asset.id === id));
     if (requestedAssets.some((asset) => !asset)) throw new Error("asset not found");
     const mutation: TaskAssetMutation = { requested: ids.length, attached: 0, existing: 0 };
@@ -1771,11 +1796,17 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     let mappings: Array<{ intentID: string; assetID: number; summary: string }> = [];
     if (seg[1] === "t-acme-web") {
       mappings = [
-        { intentID: "i3", assetID: 6, summary: "The admin feature enumeration intent was selected from the preceding subdomain finding" },
+        {
+          intentID: "i3",
+          assetID: 6,
+          summary: "The admin feature enumeration intent was selected from the preceding subdomain finding",
+        },
         { intentID: "i5", assetID: 3, summary: "The order API testing intent was selected from the API task goal" },
       ];
     } else if (seg[1] === "t-acme-api") {
-      mappings = [{ intentID: "i5", assetID: 3, summary: "The order API testing intent was selected from the API task goal" }];
+      mappings = [
+        { intentID: "i5", assetID: 3, summary: "The order API testing intent was selected from the API task goal" },
+      ];
     }
     const sourceTaskID = mockTaskAssetID(seg[1]) ?? 0;
     const assets: IntentAsset[] = mappings.flatMap((mapping) => {
@@ -1824,7 +1855,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (!company) throw new Error("company not found");
     const reset = b.reset === true;
     const scopeResult = mockScopeRows(company.id, b.scope, reset ? [] : (company.scope ?? []));
-    if (reset && scopeResult.invalid > 0) throw new Error("company scope contains invalid rules; the original scope was not overwritten");
+    if (reset && scopeResult.invalid > 0)
+      throw new Error("company scope contains invalid rules; the original scope was not overwritten");
     company.scope = reset ? scopeResult.rows : [...(company.scope ?? []), ...scopeResult.rows];
     return { added: scopeResult.rows.length, skipped: scopeResult.skipped, invalid: scopeResult.invalid };
   }
@@ -2252,7 +2284,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/settings/web-search/test") return { ok: true, count: 5, backend: D.settings.web_search_backend };
   if (path === "/settings/python/detect") return { python_interpreter: "/usr/bin/python3" };
   if (path === "/chat")
-    return { reply: "(demo) I have injected this suggestion as a high-priority intent; the work agent will execute it as soon as possible.", mode: "hint" };
+    return {
+      reply: "(demo) Your instruction was saved for Planner.",
+      mode: "hint",
+      planner_delivery: q.get("task") ? { hint_id: ++mockPlannerInstructionId, delivery: "notified" } : undefined,
+    };
   if (path === "/gc") return { removed: 0 };
 
   // ── Tool execution history ──
@@ -2421,7 +2457,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/skills" && m === "POST") return { name: String(b.name ?? "new-skill") };
   if (seg[0] === "skills" && seg[2] === "files" && seg.length === 3) return { files: ["SKILL.md"] };
   if (seg[0] === "skills" && seg[2] === "files" && seg.length >= 4)
-    return { content: "# SKILL.md\n\n(demo) This is a sample description file for this skill.", file: seg.slice(3).join("/") };
+    return {
+      content: "# SKILL.md\n\n(demo) This is a sample description file for this skill.",
+      file: seg.slice(3).join("/"),
+    };
 
   // ── visibility ──
   if (seg[0] === "visibility" && m === "GET") return { agents: [] };
@@ -2458,8 +2497,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/intercept/history" || (seg[0] === "intercept" && seg[1] === "task")) {
     const status = q.get("status") || "";
     const decisionSource = q.get("decision_source") || "";
-    if (status && !["pending", "allowed", "denied", "timeout"].includes(status)) throw new Error("invalid approval status");
-    if (decisionSource && !["model", "rule", "unknown"].includes(decisionSource)) throw new Error("invalid decision source");
+    if (status && !["pending", "allowed", "denied", "timeout"].includes(status))
+      throw new Error("invalid approval status");
+    if (decisionSource && !["model", "rule", "unknown"].includes(decisionSource))
+      throw new Error("invalid decision source");
     const decidedBy = q.get("decided_by") || "";
     if (decidedBy && !["human", "rule", "model", "system"].includes(decidedBy)) throw new Error("invalid decided_by");
     const filtered = mockInterceptHistory.filter((row) => {

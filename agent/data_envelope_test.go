@@ -161,7 +161,7 @@ func TestPlannerInputEnvelopeSplit(t *testing.T) {
 			t.Errorf("operator text %q is not only outside the frames", op)
 		}
 	}
-	if !strings.Contains(outside, "- [operator] The human (via the main agent) added a strategic hint: "+envOpHint) {
+	if !strings.Contains(outside, "- [operator] The operator sent a message: "+envOpHint) {
 		t.Errorf("operator hint trigger not labelled operator: %q", outside)
 	}
 	opAt, hintAt := strings.Index(outside, "[Operator ("), strings.LastIndex(outside, envOpHint)

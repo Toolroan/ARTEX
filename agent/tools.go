@@ -1747,7 +1747,8 @@ type hintItem struct {
 
 // addOneHint attaches a hint node (active) to the exploration graph, optionally
 // anchored to assets; returns the id. Its origin is t.worker, the agent that wrote
-// it: "human" for the main-agent chat, "orchestrator" for cross-task orchestration.
+// it: "mainagent" for model-authored clarification, "orchestrator" for cross-task
+// orchestration. The server's raw operator-message bridge records "human".
 func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 	if len(it.TrafficRefs) > 0 && !findingTrafficBindingEnabled() {
 		return 0, fmt.Errorf("automatic agent traffic binding is off; the hint carrying traffic_refs was not saved — enable it in system settings, or hand over text only")
@@ -1962,7 +1963,7 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 }
 
 func (t *ToolSet) addHint() actool.CoreTool {
-	return t.writeExpTool("add_hint", "Attach a strategic hint to the exploration graph; the planner reads it the next time it generates intents. The hint is stored with the calling agent as its origin (human for the main-agent chat, orchestrator for cross-task orchestration, otherwise the agent's name).\n"+
+	return t.writeExpTool("add_hint", "Attach a strategic hint to the exploration graph; the planner reads it the next time it generates intents. The hint is stored with the calling agent as its origin (mainagent for model-authored Main clarifications, orchestrator for cross-task orchestration, otherwise the agent's name). Raw operator messages are forwarded separately by the server.\n"+
 		"★Batch preferred: put multiple hints in the hints array in a single submission (saves round trips vs. one call per item). Returns an ids array, same length and order as hints (failed items get id=0, details in errors). For a single hint, omit hints and pass the top-level text.",
 		obj(map[string]any{
 			"hints":        map[string]any{"type": "array", "description": "[Prefer this] array of hints to add, processed in order. Each element has the same fields as the top-level ones below (text/asset_ids/traffic_refs). The returned ids match this array in length and order.", "items": obj(map[string]any{"text": str("hint content"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": HintTrafficSchema()})},
@@ -2050,12 +2051,12 @@ func (t *ToolSet) killWorkTool() actool.CoreTool {
 }
 
 // steerWorkTool lets the planner inject a mid-run course-correction into a running
-// work WITHOUT killing it: the message reaches the worker before its next tool call,
-// which re-plans its next step (already-gathered context is kept). For in-intent
+// work WITHOUT killing it: delivery is queued for the next safe model/tool
+// boundary; a tool already running can finish. For in-intent
 // nudges ("stop doing X, focus on Y"); if the whole direction is wrong use kill_work
 // + a new intent.
 func (t *ToolSet) steerWorkTool() actool.CoreTool {
-	return t.writeExpTool("steer_work", "Inject a course-correction instruction into a running intent (work) in real time, without interrupting it or losing progress: the worker receives your instruction before its next action and adjusts accordingly. For [in-intent] corrections like 'stop doing X, focus on Y'; if the whole direction is wrong, use kill_work and dispatch a new intent instead. Check what it's doing with get_worker_output first.",
+	return t.writeExpTool("steer_work", "Queue a course-correction instruction for a running intent (work) at its next safe model/tool boundary, preserving its context. A tool already running can finish. Success means queued, not applied: stopping or budget limits can leave the correction unapplied, so inspect subsequent worker output. For in-intent corrections like 'stop doing X, focus on Y'; if the whole direction is wrong, use kill_work and dispatch a new intent instead. Check what it is doing with get_worker_output first.",
 		obj(map[string]any{
 			"intent_id": idp("the id of the intent to steer (= the work handle)"),
 			"message":   str("the course-correction instruction for the worker — state clearly what to stop and what to turn to"),
@@ -2083,7 +2084,7 @@ func (t *ToolSet) steerWorkTool() actool.CoreTool {
 			if err := t.steerWork(id, a.Message); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return actool.Text(fmt.Sprintf("course-correction instruction injected into the work of intent %d (takes effect at its next step)", id)), nil
+			return actool.Text(fmt.Sprintf("course-correction instruction queued for intent %d at its next safe model/tool boundary; an already-running tool may finish. This is not proof it was applied. Inspect the worker outcome, especially after stopping or a budget limit.", id)), nil
 		})
 }
 

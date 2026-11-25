@@ -44,13 +44,13 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { InputGroup, InputGroupAddon, InputGroupButton } from "@/components/ui/input-group";
+import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } from "@/components/ui/input-group";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
-import { api, sseUrl } from "@/lib/api";
+import { api, sseUrl, type PlannerDelivery } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
 import { isBtwCommand } from "@/lib/side-questions";
@@ -102,6 +102,13 @@ const SYSTEM_SCAN_PAGE = 500; // generic activity pages scanned to recover spars
 const MAX_KEEP = 4000; // per-session in-memory cap; older pages re-fetched on scroll-up
 const STREAM_WINDOW_MS = 5000; // "live" = activity seen within this window
 const MAX_WORKER_MESSAGE_CHARS = 4000;
+const MAX_PLANNER_MESSAGE_CHARS = 20000;
+
+function plannerDeliveryLabel(receipt: PlannerDelivery): string {
+  return receipt.delivery === "notified"
+    ? t("Saved instruction #{id}; Planner notified for its next round.", { id: receipt.hint_id })
+    : t("Saved instruction #{id} for the next eligible Planner round.", { id: receipt.hint_id });
+}
 
 function newWorkerMessageRequestID(): string {
   return (
@@ -552,6 +559,9 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const [workerMessage, setWorkerMessage] = React.useState("");
   const [workerMessageRequestId, setWorkerMessageRequestId] = React.useState("");
   const [workerMessageSending, setWorkerMessageSending] = React.useState(false);
+  const [plannerMessage, setPlannerMessage] = React.useState("");
+  const [plannerMessageSending, setPlannerMessageSending] = React.useState(false);
+  const [plannerReceipt, setPlannerReceipt] = React.useState<PlannerDelivery | null>(null);
   // Method 1, file upload: chosen attachments (already landed in the task work dir uploads/) are sent with the next message.
   const [attachments, setAttachments] = React.useState<ChatAttachment[]>([]);
   const [uploading, setUploading] = React.useState(false);
@@ -635,7 +645,11 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
         } else {
           // Soft delete: the intent is set to deleted with the reason recorded; nodes and output are kept.
           patchIntentState(session.intent_id, "deleted");
-          toast.success(t("Worker #{id} deleted (reason recorded; the planner will re-plan accordingly)", { id: session.intent_id }));
+          toast.success(
+            t("Worker #{id} deleted (reason recorded; the planner will re-plan accordingly)", {
+              id: session.intent_id,
+            }),
+          );
           setCancelReason("");
         }
       } catch (error) {
@@ -1526,9 +1540,10 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     chatStatusRequestRef.current++;
     api
       .chat(text, taskId, atts.length > 0 ? atts : undefined, active.seg ?? 0)
-      .then(({ mode }) => {
+      .then(({ mode, planner_delivery }) => {
         chatStatusRequestRef.current++;
         setMainChatRunning(mode === "llm");
+        if (planner_delivery) setPlannerReceipt(planner_delivery);
       })
       .catch((e) => {
         setInput(text); // restore so the user doesn't lose their text / attachments
@@ -1536,6 +1551,27 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
         toast.error(t("Send failed: {error}", { error: (e as Error).message || t("please retry later") }));
       })
       .finally(() => setSending(false));
+  }
+
+  function sendPlannerMessage() {
+    const text = plannerMessage.trim();
+    if (!text || plannerMessageSending) return;
+    if (Array.from(text).length > MAX_PLANNER_MESSAGE_CHARS) {
+      toast.error(t("Messages cannot exceed {count} characters", { count: MAX_PLANNER_MESSAGE_CHARS }));
+      return;
+    }
+    setPlannerMessageSending(true);
+    api
+      .sendPlannerInstruction(taskId, text)
+      .then((receipt) => {
+        setPlannerMessage("");
+        setPlannerReceipt(receipt);
+        toast.success(plannerDeliveryLabel(receipt));
+      })
+      .catch((error) => {
+        toast.error(t("Send failed: {error}", { error: (error as Error).message || t("please retry later") }));
+      })
+      .finally(() => setPlannerMessageSending(false));
   }
 
   function sendWorkerChat() {
@@ -1943,7 +1979,9 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">
                     {isMain
-                      ? t("No conversation yet. Message the main agent below to steer exploration or step into the flow.")
+                      ? t(
+                          "No conversation yet. Message the main agent below to steer exploration or step into the flow.",
+                        )
                       : t("No activity records.")}
                   </div>
                 )}
@@ -1951,6 +1989,11 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             </ScrollArea>
             {isMain ? (
               <div className="border-t p-3">
+                <p className="mb-2 text-xs text-muted-foreground" role="status">
+                  {plannerReceipt
+                    ? plannerDeliveryLabel(plannerReceipt)
+                    : t("Every message you send to Main is also shared with Planner.")}
+                </p>
                 {attachments.length > 0 && (
                   <div className="mb-2 flex flex-wrap gap-1.5">
                     {attachments.map((a) => (
@@ -2042,6 +2085,55 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                         {sending ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
                       </InputGroupButton>
                     )}
+                  </InputGroupAddon>
+                </InputGroup>
+              </div>
+            ) : isPlanner ? (
+              <div className="border-t p-3">
+                <p className="mb-2 text-xs text-muted-foreground" role="status">
+                  {plannerReceipt
+                    ? plannerDeliveryLabel(plannerReceipt)
+                    : t("Send corrections directly to Planner, including while Main is busy.")}
+                </p>
+                {taskPaused && (
+                  <p className="mb-2 text-xs text-muted-foreground">
+                    {t("Task paused. Instructions are saved until you resume it.")}
+                  </p>
+                )}
+                <InputGroup className="min-h-9 has-disabled:opacity-100">
+                  <InputGroupTextarea
+                    rows={2}
+                    aria-label={t("Message Planner")}
+                    placeholder={t("Correct the plan or worker behavior…")}
+                    value={plannerMessage}
+                    disabled={plannerMessageSending}
+                    onChange={(event) => setPlannerMessage(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (!shouldSubmitOnKey(event, sendMode)) return;
+                      event.preventDefault();
+                      sendPlannerMessage();
+                    }}
+                    aria-invalid={Array.from(plannerMessage).length > MAX_PLANNER_MESSAGE_CHARS}
+                    className="max-h-36 min-h-14 overflow-y-auto"
+                  />
+                  <InputGroupAddon align="block-end">
+                    <span className="px-1 text-[10px] tabular-nums text-muted-foreground">
+                      {Array.from(plannerMessage).length}/{MAX_PLANNER_MESSAGE_CHARS}
+                    </span>
+                    <InputGroupButton
+                      className="ml-auto"
+                      size="xs"
+                      variant="default"
+                      onClick={sendPlannerMessage}
+                      disabled={
+                        !plannerMessage.trim() ||
+                        plannerMessageSending ||
+                        Array.from(plannerMessage).length > MAX_PLANNER_MESSAGE_CHARS
+                      }
+                    >
+                      {plannerMessageSending ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
+                      {t("Send to Planner")}
+                    </InputGroupButton>
                   </InputGroupAddon>
                 </InputGroup>
               </div>
@@ -2161,19 +2253,17 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             <AlertDialogHeader>
               <AlertDialogTitle>{t("Delete Worker #{id}?", { id: cancelIntent?.intent_id ?? "" })}</AlertDialogTitle>
               <AlertDialogDescription className="break-words whitespace-normal">
-                {deleteMode === "hard" ? (
-                  boldMarkup(
-                    t(
-                      "**Hard delete** physically removes this intent and the downstream nodes **supported solely by it** (cascading to the leaves to avoid orphaned data); shared nodes, goals, and the task's root facts are kept. **This action is irreversible.** The planner is notified of the deletion and re-plans accordingly.",
-                    ),
-                  )
-                ) : (
-                  boldMarkup(
-                    t(
-                      '**Soft delete** marks the intent as "deleted" and records the reason; the intent node, execution records, registered facts, and findings **are all kept**. The planner receives "intent deleted by user + reason" and re-plans accordingly.',
-                    ),
-                  )
-                )}
+                {deleteMode === "hard"
+                  ? boldMarkup(
+                      t(
+                        "**Hard delete** physically removes this intent and the downstream nodes **supported solely by it** (cascading to the leaves to avoid orphaned data); shared nodes, goals, and the task's root facts are kept. **This action is irreversible.** The planner is notified of the deletion and re-plans accordingly.",
+                      ),
+                    )
+                  : boldMarkup(
+                      t(
+                        '**Soft delete** marks the intent as "deleted" and records the reason; the intent node, execution records, registered facts, and findings **are all kept**. The planner receives "intent deleted by user + reason" and re-plans accordingly.',
+                      ),
+                    )}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <div className="grid gap-3 py-1">

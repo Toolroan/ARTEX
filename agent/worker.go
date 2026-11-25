@@ -312,7 +312,7 @@ func artifactSpec(dir string) string {
 // pre-created by the engine (ensureRunDir), so it just writes relative paths there
 // — no manual mkdir, no cross-worker name collisions.
 func workerArtifactSpec(runDir string) string {
-	return "\n\n**Intermediate artifact output rules**: all intermediate artifacts — scripts, payloads, captured response bodies, temporary data — **must be written to this intent's dedicated work directory " + runDir + "** (already created automatically; just write with relative paths there — no manual mkdir needed) — **do NOT write to /tmp, do NOT use other absolute paths**."
+	return "\n\n**Intermediate artifact output rules**: all intermediate artifacts — scripts, payloads, captured response bodies, temporary data — **must be written to this intent's dedicated work directory " + runDir + "** (already created automatically; just write with relative paths there — no manual mkdir needed) — **do NOT write to /tmp, do NOT use other absolute paths**. Retain files actually retrieved or produced while carrying out the authorized task, preferably under artifacts/ with descriptive filenames. Report their saved paths rather than secret contents in summaries. Claim an artifact exists only after it has been saved. These retention rules do not authorize any additional collection or network activity."
 }
 
 // mainRunDirName is the run directory of a task's main agent and planner.
@@ -697,6 +697,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	noaSession := WorkerSessionID(ts.ID(), intent.ID)
 	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
 	ctx = attachSideCapture(ctx, &opts)
+	control := attachWorkerControl(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)
 
@@ -738,6 +739,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// enters the wrap-up phase on the live ctx, so a run whose tool overran the budget
 	// still settles (no external hard-timeout backstop needed). ctx itself carries only
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
-	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
+	reason, err := captureWorkerSession(ctx, s, input, emitWrap, control, opts.MaxTurns > 0 || opts.MaxDuration > 0 || opts.TokenBudget > 0)
 	return reason, tsx.Writes(), err
 }

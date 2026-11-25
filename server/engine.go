@@ -135,12 +135,6 @@ type Engine struct {
 	workMu sync.Mutex
 	work   map[int64]*workExecution
 
-	// steerBox queues planner course-corrections for a running work (keyed by intent
-	// id). The worker's PreToolUse hook drains it before its next tool call and hands
-	// the message to the model (blocking that call) so it re-plans — no kill needed.
-	steerMu  sync.Mutex
-	steerBox map[int64][]string
-
 	plannerRound sync.Map // taskID -> int, planner round counter (for UI round separators)
 
 	// Task-level timeout (see docs/task-timeout-and-settle-design.md):
@@ -171,6 +165,12 @@ type workExecution struct {
 	cancel context.CancelCauseFunc
 	done   chan error
 	action string // user action: pause | cancel
+	// Protected by workMu together with the live handle: accepting a correction
+	// and committing completion must not race. Corrections remain in every later
+	// model request; unseen corrections block all tools from the stale response.
+	steering     []string
+	steeringSeen int
+	finishing    bool
 }
 
 // nextPlannerRound returns the next planner round number for a task (1-based).
@@ -456,7 +456,7 @@ func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix(
 func NewEngine(m *Manager) *Engine {
 	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
-		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
+		work:     map[int64]*workExecution{},
 		runtimes: map[string]*taskRuntime{}}
 }
 
@@ -479,9 +479,6 @@ func (e *Engine) detachWork(intentID int64) (action string, complete func(error)
 		run.cancel(agent.AbortWorkFinished) // release resources (no-op if already cancelled)
 	}
 	e.workMu.Unlock()
-	e.steerMu.Lock()
-	delete(e.steerBox, intentID) // drop any undelivered steering for a finished work
-	e.steerMu.Unlock()
 	if run == nil {
 		return action, func(error) {}
 	}
@@ -544,43 +541,91 @@ func (e *Engine) releaseWorkControl(intentID int64, run *workExecution, action s
 }
 
 // SteerWork queues a mid-run course-correction for the work running intentID (the
-// planner's steer_work tool). The worker delivers it before its next tool call and
-// re-plans — no kill. Errors if no work is currently running that intent.
+// planner's steer_work tool). Pending corrections stop stale tool calls and are
+// included in the next model request, including when the current reply is final
+// text. A successful call means queued, not that the model has applied it.
 func (e *Engine) SteerWork(intentID int64, msg string) error {
 	if strings.TrimSpace(msg) == "" {
 		return fmt.Errorf("steering message must not be empty")
 	}
 	e.workMu.Lock()
-	running := e.work[intentID] != nil
-	e.workMu.Unlock()
-	if !running {
+	defer e.workMu.Unlock()
+	run := e.work[intentID]
+	if run == nil || run.finishing || run.action != "" {
 		return fmt.Errorf("intent %d currently has no running work (it may have finished or was never claimed)", intentID)
 	}
-	e.steerMu.Lock()
-	e.steerBox[intentID] = append(e.steerBox[intentID], msg)
-	e.steerMu.Unlock()
+	run.steering = append(run.steering, strings.TrimSpace(msg))
 	return nil
 }
 
-// drainSteer pops the oldest queued steering message for intentID (FIFO), if any.
-func (e *Engine) drainSteer(intentID int64) (string, bool) {
-	e.steerMu.Lock()
-	defer e.steerMu.Unlock()
-	q := e.steerBox[intentID]
-	if len(q) == 0 {
+// pendingSteer does not consume corrections: every sibling tool in the current
+// response must be blocked until a new model request includes the correction.
+func (e *Engine) pendingSteer(intentID int64) (string, bool) {
+	e.workMu.Lock()
+	defer e.workMu.Unlock()
+	run := e.work[intentID]
+	if run == nil || run.steeringSeen == len(run.steering) {
 		return "", false
 	}
-	msg := q[0]
-	if len(q) == 1 {
-		delete(e.steerBox, intentID)
-	} else {
-		e.steerBox[intentID] = q[1:]
+	return strings.Join(run.steering[run.steeringSeen:], "\n\n"), true
+}
+
+func (e *Engine) workerSteeringRequest(intentID int64, req llm.CompletionRequest) llm.CompletionRequest {
+	e.workMu.Lock()
+	run := e.work[intentID]
+	if run == nil || len(run.steering) == 0 {
+		e.workMu.Unlock()
+		return req
 	}
-	return msg, true
+	text := strings.Join(run.steering, "\n\n")
+	run.steeringSeen = len(run.steering)
+	e.workMu.Unlock()
+	// Copy the slice so this request-specific instruction cannot overwrite the
+	// session's history or a side-question checkpoint sharing its backing array.
+	req.Messages = append(append([]llm.Message(nil), req.Messages...), llm.UserText(
+		"[Planner corrections for this work, in chronological order]\n"+text+
+			"\nApply these instructions to the current work. Later corrections supersede earlier conflicting ones; task scope and safety constraints still apply."))
+	return req
+}
+
+// finishWorkerSteering closes admission atomically with the last pending check.
+// A correction accepted after the SDK's final Stop hook gets another session
+// prompt rather than disappearing at detachWork. Budgets/cancellation still end
+// the run; their unapplied corrections are reported by the caller.
+func (e *Engine) finishWorkerSteering(intentID int64, canContinue bool) (string, bool) {
+	e.workMu.Lock()
+	defer e.workMu.Unlock()
+	run := e.work[intentID]
+	if run == nil {
+		return "", false
+	}
+	pending := strings.Join(run.steering[run.steeringSeen:], "\n\n")
+	if pending != "" && canContinue && run.action == "" {
+		return pending, true
+	}
+	run.finishing = true
+	return pending, false
+}
+
+// A queued correction is not an application acknowledgment. Preserve the
+// failure in the graph so a later planning round (including after restart) can
+// recover it, and wake Planner after the worker's final state has been written.
+func (e *Engine) reportUnappliedSteering(t *Task, intentID int64, pending string) {
+	text := fmt.Sprintf("Planner correction was not applied before intent #%d stopped. Review its outcome and the correction before deciding whether corrected follow-up work is needed. Unapplied correction:\n%s", intentID, pending)
+	_, err := t.Store.AddNode(db.KindHint, map[string]any{"text": text}, 0, "active", "system", nil)
+	if err != nil {
+		log.Printf("[worker] task %s intent #%d could not persist unapplied steering: %v", t.ID, intentID, err)
+	}
+	e.emitActivity(t, db.Activity{Kind: "text", Worker: "system", NodeID: &intentID,
+		Summary: "A queued planner correction was not applied before the worker stopped; Planner review is needed.", Detail: text, IsError: true})
+	t.trigMu.Lock()
+	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "steering_unapplied", IntentID: intentID, Detail: pending})
+	t.trigMu.Unlock()
+	t.Notify()
 }
 
 // steerHooks wraps the guard's hook runner so the planner can steer a running work:
-// before each tool call it drains a queued course-correction (if any) and blocks the
+// before each tool call it checks for a queued course-correction and blocks the
 // call, handing the message back to the model — which re-plans its next step instead
 // of running the tool. No queued message → the guard behaves exactly as before.
 // It also handles rerunning "idle turns"; see Stop.
@@ -635,7 +680,7 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 }
 
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
-	if msg, ok := h.drain(); ok {
+	if msg, ok := h.pendingCorrection(); ok {
 		return true, "[Planner real-time steering] " + msg +
 			"\n(This is the planner's immediate instruction for this intent; the tool call was not executed — adjust your next step accordingly. If it conflicts with your current plan, this takes precedence.)", nil
 	}
@@ -643,9 +688,26 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 		return true, agent.WorkerBudgetWrapup, nil
 	}
 	if h.inner != nil {
-		return h.inner.PreToolUse(ctx, name, input)
+		blocked, message, updated := h.inner.PreToolUse(ctx, name, input)
+		if blocked {
+			return blocked, message, updated
+		}
+		// Scope approval can wait for human input. A correction accepted during
+		// that wait must still stop the stale call before it is admitted.
+		if correction, ok := h.pendingCorrection(); ok {
+			return true, "[Planner real-time steering] " + correction +
+				"\nThe tool call was not executed. Adjust your next step within the existing task scope and constraints.", nil
+		}
+		return false, message, updated
 	}
 	return false, "", nil
+}
+
+func (h steerHooks) pendingCorrection() (string, bool) {
+	if h.drain == nil {
+		return "", false
+	}
+	return h.drain()
 }
 
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
@@ -666,6 +728,12 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 	)
 	if h.inner != nil {
 		prevent, blocking, msg = h.inner.Stop(ctx, messages)
+	}
+	if !prevent && ctx.Err() == nil && !agent.IsRefusalStop(agent.LastStopReason(ctx)) {
+		if correction, ok := h.pendingCorrection(); ok {
+			return false, append(blocking, "[Planner real-time steering] "+correction+
+				"\nBefore finishing, apply this correction to the current work or explain why the task constraints prevent it."), msg
+		}
 	}
 	// inner has already decided to hard-stop, or is already injecting its own rerun message → respect it and add nothing.
 	// limit<=0 = the user configured the "empty response retry count" as -1, i.e. explicitly disabled this layer.
@@ -889,6 +957,43 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
+// runPlannerWakeLoop keeps the heartbeat deadline when an ordinary edge was
+// suppressed by quiet mode. Otherwise a busy stream of worker notifications
+// could postpone the planner's periodic supervision forever.
+func runPlannerWakeLoop(ctx context.Context, notify <-chan struct{}, interval time.Duration, runRound func(string) bool) {
+	heartbeat := time.NewTimer(interval)
+	defer heartbeat.Stop()
+	for {
+		var quietSkipped bool
+		select {
+		case <-ctx.Done():
+			return
+		case <-notify:
+			quietSkipped = runRound("edge")
+		case <-heartbeat.C:
+			runRound("heartbeat")
+		}
+		if !quietSkipped {
+			resetPlannerTimer(heartbeat, interval)
+		}
+	}
+}
+
+// takePlannerTriggers atomically takes one batch, then makes the quiet decision
+// from that same batch. Events arriving afterwards stay queued for the next wake.
+func takePlannerTriggers(t *Task, quietCandidate bool) ([]agent.TriggerEvent, bool) {
+	triggers := t.drainTriggers()
+	if quietCandidate {
+		for _, trigger := range triggers {
+			if (trigger.Kind == "hint" && trigger.HintOrigin == "human" && len(trigger.Hints) > 0) || trigger.Kind == "steering_unapplied" {
+				return triggers, false
+			}
+		}
+		return triggers, true
+	}
+	return triggers, false
+}
+
 // quietSkipEdge reports whether an edge-triggered planning round should be
 // dropped (#79): the open-goal set is unchanged since the last completed round
 // AND active work exists (open or running intents). Fails open (false) on any
@@ -920,19 +1025,17 @@ func (e *Engine) plannerGateContext(ctx context.Context, t *Task, wait time.Dura
 
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	interval := plannerHeartbeatInterval(t)
-	// Arming the heartbeat timer at loop entry = counting from the task start: even a
-	// seed task that skips the first planner round (Run does not kick the first round
-	// when the frontier is non-empty) and blocks here gets its first planning round at "task start + interval". Every later wake-up (edge/heartbeat) re-arms it = time since the last planning trigger of any kind.
-	heartbeat := time.NewTimer(interval)
-	defer heartbeat.Stop()
-
-	// runRound runs one planning round (with debounce coalescing + the guards). src is only used to tell the trigger source apart in logs.
-	runRound := func(src string) {
+	// runRound returns true only for a quiet-suppressed edge, which must not
+	// postpone the heartbeat. Lifecycle and budget gates still take precedence.
+	runRound := func(src string) bool {
 		// debounce: coalesce a burst of changes into one planning round
 		timer := time.NewTimer(e.debounce)
+		defer timer.Stop()
 	drain:
 		for {
 			select {
+			case <-ctx.Done():
+				return false
 			case <-t.notify:
 			case <-timer.C:
 				break drain
@@ -940,24 +1043,24 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		planner, _ := e.snapshotFor(t)
 		if planner == nil {
-			return // idle until LLM configured
+			return false // idle until LLM configured
 		}
 		if e.IsPaused(t.ID) {
-			return // user-paused: don't plan
+			return false // user-paused: don't plan
 		}
 		if e.IsDeleting(t.ID) {
-			return
+			return false
 		}
 		// terminal task (goals all met → done, or failed): the run is over. A
 		// resume/nudge — e.g. auto-resume of the active task on restart — must NOT
 		// re-plan (it would burn an LLM round and re-confirm a settled result).
 		if isTerminalStatus(t.lifecycleSnapshot().Status) {
-			return
+			return false
 		}
 		// Task-level timeout settlement in progress: drop ordinary wake-ups — neither
 		// worker settlement write-backs nor Resume's Notify trigger regular planning rounds; the final round is driven directly by the coordinator (settleTask), not here.
 		if e.isSettling(t.ID) {
-			return
+			return false
 		}
 		// goalless (human direct-inject) branch: when the task has no open goals the
 		// planner does not run — running it would re-judge met→cancelExec and kill intents
@@ -975,43 +1078,37 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 						Summary: "All goals have been met, the direct-injected intents have finished executing, and the task is over"})
 				}
 			}
-			return // the goalless branch never enters planner.Plan
+			return false // the goalless branch never enters planner.Plan
 		}
 		// Run budget (off by default): no worker affordable any more → the forced
 		// wrap-up (once) instead of a normal round.
 		if e.budgetStop(ctx, t) {
-			return
-		}
-		// quiet-mode (#79): an edge round is redundant while work is in flight
-		// and the open-goal set is unchanged since the last completed round —
-		// there is no new decision for the plan to make. Drain the triggers so
-		// they do not accumulate and let the heartbeat supervise; the next edge
-		// after a goal opens or closes, or once the frontier drains and all
-		// workers are idle, plans for real.
-		if src == "edge" && t.PlanQuietMode && e.quietSkipEdge(t) {
-			t.drainTriggers()
-			log.Printf("[planner] task %s quiet: work in flight, goals unchanged, edge round skipped", t.ID)
-			return
+			return false
 		}
 		if !e.beginTaskOperation(t.ID) {
-			return
+			return false
 		}
 		defer e.decInflight(t.ID)
+		ectx := e.execContextFor(ctx, t.ID)
+		if ectx.Err() != nil || e.IsDeleting(t.ID) {
+			return false
+		}
+		// Ordinary worker edges can wait while goals are unchanged and work is
+		// active. An operator's correction must reach this round immediately.
+		triggers, quietSkipped := takePlannerTriggers(t, src == "edge" && t.PlanQuietMode && e.quietSkipEdge(t))
+		if quietSkipped {
+			log.Printf("[planner] task %s quiet: work in flight, goals unchanged, edge round skipped", t.ID)
+			return true
+		}
 		e.stampFirstRun(t) // first real planning round → stamp first_run_at + compute the deadline (only for tasks with a timeout)
 		e.touch(t.ID)
 		emit := func(r db.Activity) { e.emitActivity(t, r) }
-		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; carries the task deadline
-		if ectx.Err() != nil || e.IsDeleting(t.ID) {
-			return
-		}
+		ectx = e.clockCtx(ectx, t, false) // cancellable by Pause; carries the task deadline
 		log.Printf("[planner] task %s planning… (trigger: %s)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
 		// UI can separate rounds in the transcript (kind='round').
 		e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 			Summary: fmt.Sprintf("Planning round %d", e.nextPlannerRound(t.ID))})
-		// what fired this round (worker done / finding; may be several — debounce
-		// coalesces a burst; empty for time/heartbeat wakes).
-		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		pctx := e.budgetRoundCtx(e.plannerGateContext(ectx, t, intercept.DefaultTargetWaitBound), t, false)
 		e.BeginLLMCall(t.ID)
@@ -1043,21 +1140,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			t.Notify() // this round crossed the budget: settle on the next round, not at the next heartbeat
 		}
 		e.touch(t.ID)
+		return false
 	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.notify:
-			runRound("edge") // worker finish / finding / kill / resume / seed first round
-		case <-heartbeat.C:
-			// Periodic safety net: deadlock fallback + wake up to supervise in-flight workers (steer/kill) + periodic recheck.
-			runRound("heartbeat")
-		}
-		// Re-arm the heartbeat after every wake-up (edge or heartbeat): any planning trigger restarts this idle timer.
-		resetPlannerTimer(heartbeat, interval)
-	}
+	runPlannerWakeLoop(ctx, t.notify, interval, runRound)
 }
 
 // claimSweepLoop periodically returns this task's expired intent claims (no
@@ -1246,12 +1331,17 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// cap is a per-intent total, and one rerun round must not reset it back to zero.
 	hooks := steerHooks{
 		inner:  t.Guard.Hooks(),
-		drain:  func() (string, bool) { return e.drainSteer(iid) },
+		drain:  func() (string, bool) { return e.pendingSteer(iid) },
 		nudges: &atomic.Int64{},
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
 		budget: meter,
 	}
+	workCtx = agent.WithWorkerControl(workCtx,
+		func(req llm.CompletionRequest) llm.CompletionRequest { return e.workerSteeringRequest(iid, req) },
+		func(canContinue bool) (string, bool) {
+			return e.finishWorkerSteering(iid, canContinue && workCtx.Err() == nil)
+		})
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
@@ -1283,6 +1373,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		e.EndLLMCall(t.ID)
 	}
+	unappliedSteering, _ := e.finishWorkerSteering(iid, false)
 	stopHeartbeat() // no longer busy: the state writes below follow within the just-renewed claim
 	if meter != nil {
 		meter.Finish() // feeds the per-worker cost estimate
@@ -1308,6 +1399,11 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	var controlErr error
 	defer func() { completeWork(controlErr) }()
+	if unappliedSteering != "" {
+		// This defer runs before completeWork: a waiting cancellation handler
+		// must not delete the intent while its failure report is being written.
+		defer e.reportUnappliedSteering(t, iid, unappliedSteering)
+	}
 	if action == "pause" {
 		controlErr = t.Store.SettleIntentClaim(intent.ID, token, "paused")
 		if controlErr != nil {

@@ -933,6 +933,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // upload method 1: files land in uploads/ under the conversation/task work dir
 	mux.HandleFunc("GET /api/tasks/{id}/chat/status", s.taskChatStatus)
 	mux.HandleFunc("POST /api/tasks/{id}/chat/stop", s.stopChat)
+	mux.HandleFunc("POST /api/tasks/{id}/planner-instructions", s.plannerInstructions)
 
 	// --- Admin API (PostgreSQL data source; new database & admin console plan) ---
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.pgDeleteTask)
@@ -4286,14 +4287,27 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		Attachments []chatAttachment `json:"attachments,omitempty"` // files uploaded via method 1 (paths relative to the task work dir)
 		Seg         *int             `json:"seg,omitempty"`         // target main-session segment; omitted = newest segment
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxPlannerChatBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
+		return
+	}
+	maTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	mainDir := filepath.Join(s.m.dir, "tasks", strconv.FormatInt(maTaskID, 10), "main")
+	plannerText, err := mainPlannerInstruction(req.Message, req.Attachments, mainDir)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	agentMessage, ok := s.prepareChatMentionMessage(w, req.Message)
 	if !ok {
 		return
 	}
+	if !s.engine.beginTaskOperation(t.ID) {
+		writeErr(w, http.StatusConflict, "Task is being deleted or the server is draining")
+		return
+	}
+	defer s.engine.decInflight(t.ID)
 	// Admission is serialized with deletion's chat cancellation. Mark every chat
 	// turn busy before its first activity/file write, including rule-mode turns.
 	// If deletion wins the race, the second barrier check rejects this request.
@@ -4313,6 +4327,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	s.chatBusy[t.ID] = true
 	s.chatCancel[t.ID] = cancel
 	s.chatMu.Unlock()
+	// Every accepted USER message reaches Planner independently of Main's model
+	// choices. A persistence failure releases the busy state and starts no model.
+	plannerDelivery, err := s.savePlannerInstruction(t, plannerText)
+	if err != nil {
+		s.finishTaskChat(t.ID, cancel)
+		writeErr(w, http.StatusInternalServerError, "Message was not accepted because its Planner instruction could not be saved")
+		return
+	}
 
 	// The turn belongs to whichever main-agent segment the user is chatting in (any
 	// segment is interactive, like the top-level chat conversations). Stamp every
@@ -4355,12 +4377,13 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				rec.MainSeg = segPtr
 				s.engine.emitActivity(t, rec)
 			}
-			maTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 			resume := func() { s.reviveTask(t) } // set_goals added a goal → pulls the task back to running
 			// Splice the list of [absolute paths] of uploaded attachments into the message sent to the agent; it uses them to open files via Read/Bash.
 			// mainDir = the main agent's run directory (its CWD, tasks/<id>/main), the same call as chatUpload's target dir and the agent itself.
 			mainDir := agent.EnsureRunDir(s.m.dir, maTaskID, 0)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, mainDir)
+			receipt, _ := json.Marshal(plannerDelivery)
+			agentMsg += "\n\n[Server Planner handoff receipt for this user message]\n" + string(receipt) + "\nThe message is already saved. Notification is not proof that Planner or a worker has acted. Do not duplicate this unchanged message with add_hint."
 			// Tag the turn for the target gate: the task, the "mainagent" lane and the approval scope.
 			gctx := intercept.WithTaskContext(ctx, t.ID, "mainagent", func(a db.Activity) {
 				a.Worker = "mainagent"
@@ -4374,13 +4397,13 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "(main agent error: " + err.Error() + ")", MainSeg: segPtr})
 			}
 		}()
-		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm"})
+		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm", "planner_delivery": plannerDelivery})
 		return
 	}
-	reply := s.fallbackChat(t, req.Message)
+	reply := s.fallbackChat(t, req.Message, plannerDelivery)
 	s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: reply, MainSeg: segPtr})
 	s.finishTaskChat(t.ID, cancel)
-	writeJSON(w, 200, map[string]any{"reply": reply, "mode": "rule"})
+	writeJSON(w, 200, map[string]any{"reply": reply, "mode": "rule", "planner_delivery": plannerDelivery})
 }
 
 func (s *Server) cancelTaskChat(taskID string, cause error) bool {
@@ -4433,18 +4456,18 @@ func (s *Server) stopChat(w http.ResponseWriter, r *http.Request) {
 }
 
 // fallbackChat is the no-LLM human-steering handler: simple commands + situation summary.
-func (s *Server) fallbackChat(t *Task, msg string) string {
+func (s *Server) fallbackChat(t *Task, msg string, delivery plannerInstructionDelivery) string {
 	m := strings.TrimSpace(msg)
 	lower := strings.ToLower(m)
 	switch {
 	case strings.HasPrefix(m, "intent") || strings.HasPrefix(lower, "intent"):
 		text := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(m, "intent"), "intent"))
-		_, _ = t.Store.AddIntent(map[string]any{"summary": text}, 9, nil, "human")
+		if _, err := t.Store.AddIntent(map[string]any{"summary": text}, 9, nil, "human"); err != nil {
+			return "The message was saved for Planner, but the direct intent could not be created."
+		}
 		return "Injected one high-priority intent: " + text
 	case strings.HasPrefix(m, "hint") || strings.HasPrefix(lower, "hint"):
-		text := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(m, "hint"), "hint"))
-		_, _ = t.Store.AddNode(db.KindHint, map[string]any{"text": text}, 0, "active", "human", nil)
-		return "Hint recorded; the planner will read it next time: " + text
+		return fmt.Sprintf("Planner instruction #%d saved for the next eligible planning round.", delivery.HintID)
 	default:
 		assetCounts, _ := s.m.Assets().CountsByType()
 		assets := 0

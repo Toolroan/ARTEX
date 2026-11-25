@@ -145,11 +145,6 @@ func runAgentKind(t *testing.T, kind string, f hookReachFixture, ctx context.Con
 		if _, _, err := p.Plan(ctx, f.expID, nil, f.ts, "probe goal", nil, passHooks{}, nil); err != nil {
 			t.Fatal(err)
 		}
-	case "mainagent":
-		m := NewMainAgent(prov, "test-model", f.workDir, nil, 0, 3)
-		if _, err := m.Chat(ctx, f.expID, 0, nil, f.ts, "probe goal", "status?", passHooks{}, nil, nil, nil, nil, nil); err != nil {
-			t.Fatal(err)
-		}
 	case "chat":
 		c := NewChatAgent(prov, "test-model", t.TempDir(), nil, 0)
 		c.SetGuard(guard.New())
@@ -159,11 +154,11 @@ func runAgentKind(t *testing.T, kind string, f hookReachFixture, ctx context.Con
 	}
 }
 
-// Each agent kind's WebFetch reaches a pinned name at its pinned address, and
+// Each network-capable agent kind's WebFetch reaches a pinned name at its pinned address, and
 // once the name answers another address it connects nowhere and asks. A fifth
 // agent kind built without the dialer fails this table once it is added to it.
 func TestWebFetchDialerWiredOnEveryAgentKind(t *testing.T) {
-	for _, kind := range []string{"worker", "planner", "mainagent", "chat"} {
+	for _, kind := range []string{"worker", "planner", "chat"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newHookReachFixture(t)
 			d := testDB(t)

@@ -3975,7 +3975,7 @@ export function assetRefsFor(_assetId: number) {
 }
 
 // ── Workspace file manager (/workspace/*, demo: static sample tree) ──
-const WS_TREE: Record<string, { name: string; dir: boolean; size: number; content?: string }[]> = {
+const WS_TREE: Record<string, { name: string; dir: boolean; size: number; content?: string; binary?: boolean }[]> = {
   "": [
     { name: "t-001", dir: true, size: 0 },
     { name: "transcripts", dir: true, size: 0 },
@@ -4003,6 +4003,35 @@ const WS_TREE: Record<string, { name: string; dir: boolean; size: number; conten
       dir: false,
       size: 180,
       content: "<!-- (demo) captured response body fragment -->\n<html><body>MySQL error near ''1'='1'</body></html>\n",
+    },
+  ],
+  // Synthetic artifact fixtures; no task transcript or retrieved data is used.
+  "tasks/t-acme-web": [
+    { name: "main", dir: true, size: 0 },
+    { name: "i12", dir: true, size: 0 },
+  ],
+  "tasks/t-acme-web/main": [
+    {
+      name: "evidence.txt", dir: false, size: 70,
+      content: "Synthetic artifact preview fixture.\nNo production data is stored here.\n",
+    },
+    {
+      name: "inert-preview.html", dir: false, size: 144,
+      content: '<h1>Display as text only</h1>\n<script>window.__artifactExecuted = true</script>\n<img src="invalid" onerror="window.__artifactExecuted = true">\n',
+    },
+    {
+      name: "sample-export.sql", dir: false, size: 110,
+      content: "-- Synthetic SQL export; preview only, never execute.\nCREATE TABLE example_fixture (id integer, label text);\n",
+    },
+  ],
+  "tasks/t-acme-web/i12": [
+    { name: "large-dump.bin", dir: false, size: 5 * 1024 * 1024 * 1024, binary: true },
+    { name: "small-binary.bin", dir: false, size: 64, binary: true },
+  ],
+  "spill/tasks/t-acme-web": [
+    {
+      name: "saved-output.txt", dir: false, size: 65,
+      content: "Synthetic saved tool output.\nThis is a browser verification fixture.\n",
     },
   ],
   transcripts: [
@@ -4034,6 +4063,8 @@ export function workspaceRead(path: string) {
   const parent = slash >= 0 ? key.slice(0, slash) : "";
   const name = slash >= 0 ? key.slice(slash + 1) : key;
   const f = (WS_TREE[parent] ?? []).find((x) => x.name === name && !x.dir);
+  if (f && f.size > 2 * 1024 * 1024) return { path: key, size: f.size, binary: true, too_large: true };
+  if (f?.binary) return { path: key, size: f.size, binary: true };
   return { path: key, size: f?.size ?? 0, binary: false, content: f?.content ?? "" };
 }
 

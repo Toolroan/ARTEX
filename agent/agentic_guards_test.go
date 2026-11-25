@@ -261,7 +261,7 @@ func TestRenderTriggersHintOrigin(t *testing.T) {
 	env := newDataEnvelope()
 	framed := "\n" + env.wrap("hints", "h1") + "\n"
 	for origin, want := range map[string]string{
-		"human":        "- [operator] The human (via the main agent) added a strategic hint: h1",
+		"human":        "- [operator] The operator sent a message: h1",
 		"orchestrator": "- A cross-task orchestration added a strategic hint: " + framed,
 		"worker-3":     "- An agent (worker-3) added a strategic hint: " + framed,
 		"":             "- A source that was not recorded added a strategic hint: " + framed,

@@ -97,10 +97,11 @@ type scopeProbe struct {
 type scopeProbeProvider struct {
 	seen chan scopeProbe
 	turn atomic.Int64
+	tool string
 }
 
 func newScopeProbeProvider() *scopeProbeProvider {
-	return &scopeProbeProvider{seen: make(chan scopeProbe, 16)}
+	return &scopeProbeProvider{seen: make(chan scopeProbe, 16), tool: "LS"}
 }
 
 func (p *scopeProbeProvider) Stream(ctx context.Context, _ llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
@@ -112,7 +113,7 @@ func (p *scopeProbeProvider) Stream(ctx context.Context, _ llm.CompletionRequest
 	events := []llm.StreamEvent{{Type: llm.SETextDelta, Text: "done"}, {Type: llm.SEMessageDelta, StopReason: "end_turn"}}
 	if p.turn.Add(1) == 1 {
 		events = []llm.StreamEvent{
-			{Type: llm.SEToolUseStart, ToolID: "call-1", ToolName: "LS"},
+			{Type: llm.SEToolUseStart, ToolID: "call-1", ToolName: p.tool},
 			{Type: llm.SEToolInputJSON, Text: `{}`},
 			{Type: llm.SEMessageDelta, StopReason: "tool_use"},
 		}
@@ -237,6 +238,9 @@ func (f *targetScopeFixture) finalPlannerRound(t *testing.T, task *Task) scopePr
 func (f *targetScopeFixture) mainAgentTurn(t *testing.T, task *Task) scopeProbe {
 	t.Helper()
 	probe := newScopeProbeProvider()
+	// Main has no filesystem tools. Its permitted graph read must still reach
+	// the task's target-only hooks on the correctly scoped context.
+	probe.tool = "graph_overview"
 	f.s.cfgMu.Lock()
 	f.s.llmOn, f.s.llmProv = true, probe
 	f.s.cfgMu.Unlock()
@@ -311,11 +315,12 @@ func TestEveryAgentKindCarriesTargetScope(t *testing.T) {
 		run        func(*testing.T, *Task) scopeProbe
 		wait       time.Duration
 		targetOnly bool // the session runs on Task.TargetGuard, not Task.Guard
+		tool       string
 	}{
-		{"planner round", f.plannerLoopRound, intercept.DefaultTargetWaitBound, true},
-		{"final planner round", f.finalPlannerRound, 0, true},
-		{"main-agent turn", f.mainAgentTurn, intercept.DefaultTargetWaitBound, true},
-		{"worker intent", f.workerIntent, intercept.DefaultTargetWaitBound, false},
+		{"planner round", f.plannerLoopRound, intercept.DefaultTargetWaitBound, true, "LS"},
+		{"final planner round", f.finalPlannerRound, 0, true, "LS"},
+		{"main-agent turn", f.mainAgentTurn, intercept.DefaultTargetWaitBound, true, "graph_overview"},
+		{"worker intent", f.workerIntent, intercept.DefaultTargetWaitBound, false, "LS"},
 	}
 	for _, site := range taskSites {
 		t.Run(site.name, func(t *testing.T) {
@@ -324,11 +329,11 @@ func TestEveryAgentKindCarriesTargetScope(t *testing.T) {
 			task.TargetGuard = recorder
 			got := site.run(t, task)
 			onTarget, onMain := auditedTools(recorder), auditedTools(task.Guard)
-			if site.targetOnly && (len(onTarget) != 1 || onTarget[0] != "LS" || len(onMain) != 0) {
-				t.Fatalf("tool calls seen by TargetGuard=%v Guard=%v, want one LS on TargetGuard only", onTarget, onMain)
+			if site.targetOnly && (len(onTarget) != 1 || onTarget[0] != site.tool || len(onMain) != 0) {
+				t.Fatalf("tool calls seen by TargetGuard=%v Guard=%v, want one %s on TargetGuard only", onTarget, onMain, site.tool)
 			}
-			if !site.targetOnly && (len(onMain) != 1 || onMain[0] != "LS" || len(onTarget) != 0) {
-				t.Fatalf("tool calls seen by TargetGuard=%v Guard=%v, want one LS on Guard only", onTarget, onMain)
+			if !site.targetOnly && (len(onMain) != 1 || onMain[0] != site.tool || len(onTarget) != 0) {
+				t.Fatalf("tool calls seen by TargetGuard=%v Guard=%v, want one %s on Guard only", onTarget, onMain, site.tool)
 			}
 			if !got.ok || got.scope.TaskID != task.ID || got.scope.ConversationID != 0 {
 				t.Fatalf("scope = %+v (present=%v), want task %s", got.scope, got.ok, task.ID)

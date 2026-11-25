@@ -40,6 +40,7 @@ import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import type { LLMProfile, Task } from "@/lib/types";
 
+import { ArtifactsTab } from "./_tabs/artifacts-tab";
 import { AssetsTab } from "./_tabs/assets-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
@@ -61,6 +62,7 @@ const TABS = [
   { value: "findings", label: t("Findings") },
   { value: "retests", label: t("Retests") },
   { value: "assets", label: t("Test assets") },
+  { value: "artifacts", label: t("Artifacts") },
   { value: "credentials", label: t("Credentials") },
   { value: "coverage", label: t("Asset coverage") },
   { value: "intercept", label: t("Interception approval") },
@@ -438,7 +440,7 @@ function TaskDetailInner() {
       {/* Tab content */}
       <div className="flex-1 p-4 lg:p-6">
         <TabsContent value="sessions" className="mt-0">
-          <SessionsTab taskId={id} taskPaused={task?.status === "paused"} />
+          <SessionsTab key={id} taskId={id} taskPaused={task?.status === "paused"} />
         </TabsContent>
         <TabsContent value="overview" className="mt-0">
           <OverviewTab taskId={id} />
@@ -457,6 +459,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="assets" className="mt-0">
           <AssetsTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="artifacts" className="mt-0">
+          <ArtifactsTab key={id} taskId={id} onOpenCredentials={() => setTab("credentials")} />
         </TabsContent>
         <TabsContent value="credentials" className="mt-0">
           <CredentialsTab taskId={id} />
