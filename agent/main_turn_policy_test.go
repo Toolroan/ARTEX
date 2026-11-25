@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -31,10 +32,16 @@ func TestMainTurnReadOnlyRejectsActualModelMutations(t *testing.T) {
 				return actool.Text(""), nil
 			}})
 			main := NewMainAgent(p, "fixture", t.TempDir(), nil, 0, 3)
-			if _, err := main.Chat(ctx, 0, 0, nil, &db.ExplorationStore{}, "fixture", "What's the status?", passHooks{}, nil, nil, nil, nil, nil); err != nil {
+			var emittedCalls int
+			reply, err := main.Chat(ctx, 0, 0, nil, &db.ExplorationStore{}, "fixture", "What's the status?", passHooks{}, func(a db.Activity) {
+				if a.Kind == "tool_use" {
+					emittedCalls++
+				}
+			}, nil, nil, nil, nil)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if len(p.reqs) != 2 {
+			if len(p.reqs) != 1 {
 				t.Fatalf("requests=%d", len(p.reqs))
 			}
 			for _, tool := range p.reqs[0].Tools {
@@ -42,12 +49,8 @@ func TestMainTurnReadOnlyRejectsActualModelMutations(t *testing.T) {
 					t.Fatalf("write exposed: %s", tool.Name)
 				}
 			}
-			for _, message := range p.reqs[1].Messages {
-				for _, block := range message.Content {
-					if block.Type == llm.BlockToolResult && !block.IsError {
-						t.Fatal("model mutation succeeded")
-					}
-				}
+			if emittedCalls != 0 || !strings.Contains(reply, "not a temporary tool outage") {
+				t.Fatalf("blocked response escaped: calls=%d reply=%q", emittedCalls, reply)
 			}
 		})
 	}

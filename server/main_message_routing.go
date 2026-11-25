@@ -214,6 +214,8 @@ func (s *Server) messageReceipt(t *Task, msg *db.MainMessage) mainMessageReceipt
 		r.Delivery, r.Reason = "clarify", msg.Clarification
 	case msg.DeliveryStatus == "needs_review":
 		r.Delivery, r.Reason = "needs_review", "Processing was interrupted. Check existing effects before sending another instruction."
+	case msg.DeliveryStatus == "inflight" && (msg.DeliveryUntil == nil || !msg.DeliveryUntil.After(time.Now())):
+		r.Delivery, r.Reason = "needs_review", "The delivery lease expired or is unavailable. Processing is uncertain; check existing effects before sending another instruction."
 	case msg.DeliveryStatus == "presented":
 		r.Delivery, r.Reason = "presented", "Reviewed; this is not confirmation that a worker applied it."
 	case msg.DeliveryOwner == "main":
@@ -559,6 +561,7 @@ func (s *Server) runMainMessage(ctx context.Context, t *Task, msg *db.MainMessag
 	gctx = intercept.WithTargetScope(gctx, t.targetScope(intercept.DefaultTargetWaitBound))
 	gctx = agent.WithMainTurnPolicy(gctx, s.mainMutationPolicy(t, msg))
 	gctx = agent.WithMainConversationReader(gctx, conversationReader(t, seg))
+	gctx = agent.WithInstructionStatusReader(gctx, s.instructionStatusReader(t, seg, msg.ID))
 	gctx, stopHeartbeat := startMainDeliveryHeartbeat(gctx, t, msg.DeliveryToken)
 	s.engine.BeginLLMCall(t.ID)
 	reply, err := s.agentsForTask(t).main.Chat(gctx, routingTaskID(t.ID), seg, s.m.Assets(), t.Store, t.Goal, agentMsg, t.TargetGuard.Hooks(), emit, t.Notify, func() {

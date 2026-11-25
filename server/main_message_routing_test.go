@@ -74,8 +74,14 @@ func TestMainMessageStatusActuallyReadOnlyAndCorrectionQueued(t *testing.T) {
 				t.Fatalf("messages=%+v err=%v", messages, err)
 			}
 			m := messages[0]
-			if m.Route != kind || m.AssistantText != "Fixture answer from existing evidence." {
+			if m.Route != kind || !strings.Contains(m.AssistantText, "not a temporary tool outage") || !strings.Contains(m.AssistantText, "Main will not retry it") {
 				t.Fatalf("message=%+v", m)
+			}
+			if kind == "correction" && !strings.Contains(m.AssistantText, "Instruction queued for Planner.") {
+				t.Fatal("blocked Main response omitted the live Planner receipt")
+			}
+			if kind == "context" && !strings.Contains(m.AssistantText, "Conversation context only; Planner was not notified.") {
+				t.Fatal("blocked Main response misrepresented context as an instruction")
 			}
 			hints, _ := task.Store.ListByKind(db.KindHint, 20)
 			intents, _ := task.Store.ListByKind(db.KindIntent, 20)

@@ -128,6 +128,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	if tool := mainConversationTool(ctx); tool != nil {
 		trusted = append(trusted, tool)
 	}
+	if tool := instructionStatusTool(ctx); tool != nil {
+		trusted = append(trusted, tool)
+	}
 	tools := append(trusted[:0:0], trusted...)
 	if resolve := ToolResolve(); resolve != nil {
 		tools = resolve(ctx, "mainagent", tools)
@@ -176,6 +179,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	ctx = attachSideCapture(ctx, &opts)
 	enforceMainAgentRole(&opts, trusted)
 	enforceMainTurnPolicy(ctx, &opts)
+	// A resumed model can still emit legacy tool calls absent from this turn's
+	// schema. Validate each complete response before the SDK executes any part.
+	opts.Provider = GuardMainToolCalls(opts.Provider)
 	s := agentcore.NewSession(opts)
 	defer s.Close()
 	// reload the prior conversation from the transcript so the agent has context

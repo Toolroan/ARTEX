@@ -123,7 +123,13 @@ func TestMainAgentRoleRejectsExecutionAndExtensions(t *testing.T) {
 	m := NewMainAgent(p, "fixture", workDir, nil, 0, 3)
 	m.SetWebSearch(WebSearchOpts{Enabled: true})
 	m.SetNoaEnabled(func() bool { return true })
-	if _, err := m.Chat(t.Context(), 0, 0, nil, &db.ExplorationStore{}, "fixture", "delegate this work", passHooks{}, nil, nil, nil, nil, nil); err != nil {
+	var emittedCalls int
+	reply, err := m.Chat(t.Context(), 0, 0, nil, &db.ExplorationStore{}, "fixture", "delegate this work", passHooks{}, func(a db.Activity) {
+		if a.Kind == "tool_use" {
+			emittedCalls++
+		}
+	}, nil, nil, nil, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if augmentCalls.Load() != 0 || extensionCalls.Load() != 0 || networkHits.Load() != 0 {
@@ -132,8 +138,11 @@ func TestMainAgentRoleRejectsExecutionAndExtensions(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("execution marker: %v", err)
 	}
-	if len(p.reqs) != 2 {
-		t.Fatalf("provider requests=%d, want rejected calls followed by final reply", len(p.reqs))
+	if len(p.reqs) != 1 {
+		t.Fatalf("provider requests=%d, want one call and no retry", len(p.reqs))
+	}
+	if emittedCalls != 0 || !strings.Contains(reply, "not a temporary tool outage") {
+		t.Fatalf("unavailable response escaped validation: calls=%d reply=%q", emittedCalls, reply)
 	}
 	var got []string
 	for _, schema := range p.reqs[0].Tools {
@@ -147,20 +156,6 @@ func TestMainAgentRoleRejectsExecutionAndExtensions(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Fatalf("final provider tools=%v, want %v", got, want)
-	}
-	results := 0
-	for _, message := range p.reqs[1].Messages {
-		for _, block := range message.Content {
-			if block.Type == llm.BlockToolResult {
-				results++
-				if !block.IsError {
-					t.Errorf("forbidden call %s succeeded", block.ToolUseID)
-				}
-			}
-		}
-	}
-	if results != len(p.calls) {
-		t.Fatalf("tool results=%d, want %d rejections", results, len(p.calls))
 	}
 }
 

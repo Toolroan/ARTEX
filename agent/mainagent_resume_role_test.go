@@ -71,11 +71,24 @@ func TestMainAgentResumedExecutionHistoryKeepsCurrentRoleAndDelegation(t *testin
 			main := NewMainAgent(provider, "fixture", workDir, tx, 100000, 3)
 			message := "Please recompute the count from " + filePath +
 				"\n[Server Planner handoff receipt for this user message]\n{\"hint_id\":42,\"delivery\":\"saved\",\"reason\":\"Task has no open goals; saved until an open goal is available.\"}"
-			if _, err := main.Chat(t.Context(), store.ID(), 0, nil, store, "Analyze the existing fixture only", message, passHooks{}, nil, nil, nil, nil, nil); err != nil {
+			ctx := WithMainTurnPolicy(t.Context(), MainTurnPolicy{Mode: "main_oneoff", Execute: func(_ context.Context, name string, _ json.RawMessage, run func() (actool.Result, error)) (actool.Result, error) {
+				if name != "add_intent" {
+					t.Fatalf("unexpected canonical mutation: %s", name)
+				}
+				return run()
+			}})
+			ctx = WithInstructionStatusReader(ctx, func(context.Context, []int64) (InstructionStatusPage, error) {
+				return InstructionStatusPage{CurrentMessageID: 42, Items: []InstructionStatus{{MessageID: 42, Route: "action", Owner: "main", Delivery: "main", Reason: "Main owns the bounded one-off request."}}}, nil
+			})
+			reply, err := main.Chat(ctx, store.ID(), 0, nil, store, "Analyze the existing fixture only", message, passHooks{}, nil, nil, nil, nil, nil)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if len(provider.reqs) != 2 {
-				t.Fatalf("requests=%d, want tool attempt then reply", len(provider.reqs))
+			if len(provider.reqs) != 1 {
+				t.Fatalf("requests=%d, want one rejected response with no model retry", len(provider.reqs))
+			}
+			if !strings.Contains(reply, "Main will not retry") || !strings.Contains(reply, "`Bash`") || !strings.Contains(reply, "Main owns the bounded one-off request") {
+				t.Fatalf("missing authoritative refusal and fresh receipt: %s", reply)
 			}
 			first := provider.reqs[0]
 			if !strings.Contains(strings.Join(first.System, "\n"), mainAgentRoleInstructions) {
@@ -102,27 +115,37 @@ func TestMainAgentResumedExecutionHistoryKeepsCurrentRoleAndDelegation(t *testin
 			if hasDelegation != delegationEnabled {
 				t.Fatal("resumption bypassed current delegation binding")
 			}
-			results := map[string]bool{}
-			for _, msg := range provider.reqs[1].Messages {
-				for _, block := range msg.Content {
-					if block.Type == llm.BlockToolResult {
-						results[block.ToolUseID] = block.IsError
-					}
-				}
-			}
-			if rejected, exists := results["call-0"]; !exists || !rejected {
-				t.Fatal("resumed Bash attempt was not rejected")
-			}
-			if failed, exists := results["call-1"]; !exists || failed == delegationEnabled {
-				t.Fatalf("delegation result inconsistent with binding: %+v", results)
-			}
 			intents, err := store.ListByKind(db.KindIntent, 10)
 			if err != nil {
 				t.Fatal(err)
 			}
+			if len(intents) != 0 {
+				t.Fatalf("invalid response dispatched %d intents from its mixed batch", len(intents))
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("historical execution tool ran: %v", err)
+			}
+
+			// A separate valid current turn still delegates through the actual
+			// canonical handler and ownership fence. Old execution history and the
+			// refused batch must neither restore Bash nor poison valid delegation.
+			delegation := &mainRoleProvider{calls: []llm.ContentBlock{{Name: "add_intent", Input: intent}}}
+			main = NewMainAgent(delegation, "fixture", workDir, tx, 100000, 3)
+			if _, err := main.Chat(ctx, store.ID(), 0, nil, store, "Analyze the existing fixture only", "Perform the assigned bounded check of "+filePath, passHooks{}, nil, nil, nil, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			intents, err = store.ListByKind(db.KindIntent, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
 			wantIntents := 0
+			wantRequests := 1
 			if delegationEnabled {
 				wantIntents = 1
+				wantRequests = 2
+			}
+			if len(delegation.reqs) != wantRequests {
+				t.Fatalf("delegation requests=%d, want %d", len(delegation.reqs), wantRequests)
 			}
 			if len(intents) != wantIntents {
 				t.Fatalf("persisted worker intents=%d, want %d", len(intents), wantIntents)

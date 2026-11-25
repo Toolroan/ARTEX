@@ -37,7 +37,7 @@ func mainAdministrativeTool(name string) bool {
 
 func mainReadTool(name string) bool {
 	switch name {
-	case "graph_overview", "list_findings", "list_facts", "node_detail", "expand_digest", "get_worker_output", "get_worker_trace", "search_all_worker_traces", "list_assets", "list_untested_assets", "list_hints", "get_main_conversation", "list_artifacts":
+	case "graph_overview", "list_findings", "list_facts", "node_detail", "expand_digest", "get_worker_output", "get_worker_trace", "search_all_worker_traces", "list_assets", "list_untested_assets", "list_hints", "get_main_conversation", "list_artifacts", "get_instruction_status":
 		return true
 	}
 	return false
@@ -95,6 +95,6 @@ func mainTurnPolicyReminder(ctx context.Context) string {
 	case "main_oneoff":
 		return "\n[Current message routing] The server assigned this bounded one-off request to Main for worker dispatch. Check existing work and use add_intent only within this request if it is present; the server checks ownership and lifecycle at execution. Do not create goals, change scope, or dispatch duplicate work."
 	default:
-		return "\n[Current message routing] Main is read-only this turn. The receipt distinguishes conversation context, clarification/pending routing, and an instruction owned by Planner. Saved context does not mean Planner was notified. Answer from evidence, ask the supplied clarification when needed, and report the exact receipt. Do not add hints, dispatch workers, or modify goals/constraints/scope."
+		return "\n[Current message routing] Main is read-only this turn. add_intent and other mutation tools are intentionally absent for this role; their absence is not a transient outage, and earlier successful calls do not grant this turn permission. Never retry them or promise to reissue them later. The receipt distinguishes conversation context, clarification/pending routing, and an instruction owned by Planner. A queued instruction is saved in Planner's durable inbox; it does not depend on Planner discovering a hint in the conversation. Use get_instruction_status for current or recent handoff progress before reporting delivery or delays. A receipt does not establish queue starvation, duplicate work, or worker application. Answer from verified evidence and ask the supplied clarification when needed. Do not add hints, dispatch workers, or modify goals/constraints/scope."
 	}
 }
