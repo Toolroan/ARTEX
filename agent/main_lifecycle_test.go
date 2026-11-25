@@ -108,6 +108,8 @@ func TestMainLifecycleToolsRequireExactTurnOwnershipAndFence(t *testing.T) {
 		t.Fatal("stale ownership reached callback")
 	}
 	allowed = true
+	policy := ctx.Value(mainTurnPolicyKey{}).(MainTurnPolicy)
+	ctx = WithMainTurnPolicy(ctx, policy)
 	result, err = opts.Tools[0].Call(ctx, json.RawMessage(`{}`), nil)
 	if err != nil || result.IsError || calls.Load() != 1 || fences.Load() != 2 {
 		t.Fatalf("admitted lifecycle action failed: %+v err=%v calls=%d fences=%d", result, err, calls.Load(), fences.Load())
@@ -142,19 +144,19 @@ func TestMainChatRunsCanonicalLifecycleControlThroughGuard(t *testing.T) {
 		t.Fatalf("control failed: reply=%q err=%v canonical=%d fenced=%d counterfeit=%d requests=%d", reply, err, canonical.Load(), fenced.Load(), counterfeit.Load(), len(provider.reqs))
 	}
 	for _, tool := range provider.reqs[0].Tools {
-		if mainAdministrativeTool(tool.Name) && tool.Name != "continue_task" {
+		if mainAdministrativeTool(tool.Name) && tool.Name != "continue_task" && !mainStableTool(tool.Name) {
 			t.Fatalf("unrequested control exposed: %s", tool.Name)
 		}
 	}
 }
 
-func TestMainLifecycleRouteRequiresOneDedicatedControl(t *testing.T) {
+func TestMainLifecycleRouteRequiresOneLifecycleAndBoundedPlanning(t *testing.T) {
 	for _, tool := range []string{"wake_planner", "continue_task"} {
 		valid := MainMessageRoute{Kind: "control", Summary: "Explicit lifecycle request", ControlTools: []string{tool}}
 		if got, err := parseMainMessageRoute(routeJSON(valid), nil); err != nil || got.ControlTools[0] != tool {
 			t.Fatalf("valid lifecycle route rejected: %+v %v", got, err)
 		}
-		for _, tools := range [][]string{{tool, "set_goals"}, {tool, "set_constraints"}, {tool, "wake_planner"}, {tool, "continue_task"}} {
+		for _, tools := range [][]string{{tool, "set_constraints"}, {tool, "wake_planner"}, {tool, "continue_task"}} {
 			invalid := valid
 			invalid.ControlTools = tools
 			if _, err := parseMainMessageRoute(routeJSON(invalid), nil); err == nil {
@@ -168,10 +170,17 @@ func TestMainLifecycleRouteRequiresOneDedicatedControl(t *testing.T) {
 				t.Fatalf("%s route grants lifecycle control", kind)
 			}
 		}
-		provider := &routeProvider{response: llm.UserText(routeJSON(valid))}
-		got, err := RouteMainMessage(t.Context(), provider, MainMessageRouteInput{Text: "Wake Planner", Lifecycle: "paused"})
-		if err != nil || got.Kind != "clarify" || len(got.ControlTools) != 0 || !strings.Contains(got.Clarification, "Resume task") {
-			t.Fatalf("paused task acquired continuation authority: %+v %v", got, err)
+		for _, tools := range [][]string{{tool}, {tool, "set_goals"}, {tool, "set_goals", "add_intent"}} {
+			compound := valid
+			compound.ControlTools = tools
+			if got, err := parseMainMessageRoute(routeJSON(compound), nil); err != nil || len(got.ControlTools) != len(tools) {
+				t.Fatalf("valid lifecycle/goal route rejected: %+v %v", got, err)
+			}
+			provider := &routeProvider{response: llm.UserText(routeJSON(compound))}
+			got, err := RouteMainMessage(t.Context(), provider, MainMessageRouteInput{Text: "Wake Planner and register the specified goal", Lifecycle: "paused"})
+			if err != nil || got.Kind != "clarify" || len(got.ControlTools) != 0 || !strings.Contains(got.Clarification, "Resume task") {
+				t.Fatalf("paused task acquired continuation authority: %+v %v", got, err)
+			}
 		}
 	}
 }

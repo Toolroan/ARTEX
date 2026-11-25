@@ -21,9 +21,10 @@ const (
 )
 
 var (
-	ErrMainMessageConflict   = errors.New("request key already belongs to a different Main message")
-	ErrMainMessageClaimLost  = errors.New("Main message claim is no longer current")
-	ErrMainMessageParentGone = errors.New("Main message task is missing, archived, or deleted")
+	ErrMainMessageConflict    = errors.New("request key already belongs to a different Main message")
+	ErrMainMessageClaimLost   = errors.New("Main message claim is no longer current")
+	ErrMainMessageParentGone  = errors.New("Main message task is missing, archived, or deleted")
+	ErrMainPreparationPending = errors.New("Main is preparing requested work before Planner can claim another round")
 )
 
 type MainMessageInput struct {
@@ -502,8 +503,12 @@ func (s *ExplorationStore) HasQueuedPlannerMessages(ctx context.Context) (bool, 
 	return found, err
 }
 
+// Filter deferred tracked requests before LIMIT, so a Planner-owned round does
+// not hide an eligible pure Continue command behind an older work request.
+const mainDeliveryReadySQL = `NOT (EXISTS(SELECT 1 FROM work_requests w WHERE w.id=m.id AND w.state NOT IN ('completed','cancelled')) AND EXISTS(SELECT 1 FROM main_message_routes other WHERE other.exploration_id=m.exploration_id AND other.delivery_status='inflight' AND (other.delivery_owner='planner' OR (other.delivery_owner='main' AND other.id<>m.id AND EXISTS(SELECT 1 FROM work_requests w WHERE w.id=other.id AND w.state NOT IN ('completed','cancelled'))))))`
+
 func (s *ExplorationStore) ReadyMainDeliveryIDs(ctx context.Context, limit int) ([]int64, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM main_message_routes WHERE exploration_id=$1 AND delivery_status='queued' AND delivery_owner='main' ORDER BY id LIMIT $2`, s.expID, mainPageLimit(limit))
+	rows, err := s.db.QueryContext(ctx, `SELECT m.id FROM main_message_routes m WHERE m.exploration_id=$1 AND m.delivery_status='queued' AND m.delivery_owner='main' AND `+mainDeliveryReadySQL+` ORDER BY m.id LIMIT $2`, s.expID, mainPageLimit(limit))
 	if err != nil {
 		return nil, err
 	}
@@ -527,6 +532,16 @@ func (s *ExplorationStore) ClaimPlannerMessages(ctx context.Context, limit int) 
 	defer tx.Rollback()
 	if err = s.lockMainParent(ctx, tx); err != nil {
 		return nil, err
+	}
+	// Main prepares the graph before Planner receives that same request. Return
+	// an explicit deferral, not an empty inbox: callers must not treat this as
+	// permission to begin an autonomous Planner round without a delivery batch.
+	var preparing bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main_message_routes m JOIN work_requests w ON w.id=m.id WHERE m.exploration_id=$1 AND m.delivery_owner='main' AND m.delivery_status IN ('queued','inflight') AND w.state NOT IN ('completed','cancelled'))`, s.expID).Scan(&preparing); err != nil {
+		return nil, err
+	}
+	if preparing {
+		return nil, ErrMainPreparationPending
 	}
 	// One Planner owns a task's delivery at a time. Engine lifecycle, goal,
 	// budget, and scope gates remain the caller's responsibility.
@@ -581,6 +596,16 @@ func (s *ExplorationStore) ClaimMainDelivery(ctx context.Context, id int64) (*Ma
 	defer tx.Rollback()
 	if err = s.lockMainParent(ctx, tx); err != nil {
 		return nil, err
+	}
+	// A new tracked Main request waits for an already-running Planner round.
+	// It does not revoke that round's grant. Pure lifecycle/admin messages have
+	// no tracked work and remain usable while Planner is active.
+	var busy bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM work_requests WHERE exploration_id=$1 AND id=$2 AND state NOT IN ('completed','cancelled')) AND EXISTS(SELECT 1 FROM main_message_routes m WHERE m.exploration_id=$1 AND m.delivery_status='inflight' AND (m.delivery_owner='planner' OR (m.delivery_owner='main' AND m.id<>$2 AND EXISTS(SELECT 1 FROM work_requests w WHERE w.id=m.id AND w.state NOT IN ('completed','cancelled')))))`, s.expID, id).Scan(&busy); err != nil {
+		return nil, err
+	}
+	if busy {
+		return nil, tx.Commit()
 	}
 	m, err := scanMainMessage(tx.QueryRowContext(ctx, `UPDATE main_message_routes SET delivery_status='inflight',delivery_token=$3,delivery_until=now()+$4*INTERVAL '1 second',updated_at=now() WHERE exploration_id=$1 AND id=$2 AND delivery_owner='main' AND delivery_status='queued' RETURNING `+mainMessageCols, s.expID, id, uuid.NewString(), MainDeliveryLease.Seconds()))
 	if err != nil {

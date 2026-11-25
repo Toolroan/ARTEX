@@ -32,7 +32,7 @@ func routingFixtureProvider(t *testing.T, s *Server, kind string, attemptMutatio
 			return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock(text)}}, "end_turn", llm.Usage{}, nil
 		}
 		for _, tool := range req.Tools {
-			if tool.Name == "set_goals" || tool.Name == "add_intent" || tool.Name == "add_hint" {
+			if tool.Name == "add_hint" {
 				t.Errorf("read-only Main exposed %s", tool.Name)
 			}
 		}

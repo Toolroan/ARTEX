@@ -293,6 +293,10 @@ func (e *Engine) settleTask(ctx context.Context, t *Task, budget bool) {
 // task-timeout planner words (final goal judgment; no new intents). Waits for the
 // LLM to be ready (bounded by ctx) so a completable task isn't mis-judged timeout.
 func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, budget bool) (met bool) {
+	if !t.planningMu.TryLock() {
+		return false // unfinished preparation cannot be judged complete at timeout
+	}
+	defer t.planningMu.Unlock()
 	if e.IsDeleting(t.ID) {
 		return false
 	}

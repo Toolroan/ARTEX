@@ -7,21 +7,38 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
-// Only a single explicit lifecycle operation may cross the ordinary Main write
-// gate. A mixed or malformed decision never authorizes continuation.
+// One explicit lifecycle operation may accompany current goal registration.
+// Unrelated controls and malformed decisions never authorize continuation.
 func mainLifecycleTool(msg *db.MainMessage) string {
 	if msg == nil || msg.Route != "control" || msg.RoutingStatus != "routed" || msg.DeliveryOwner != "main" {
 		return ""
 	}
 	var decision agent.MainMessageRoute
-	if json.Unmarshal(msg.DecisionData, &decision) != nil || decision.Kind != "control" || len(decision.ControlTools) != 1 {
+	if json.Unmarshal(msg.DecisionData, &decision) != nil || decision.Kind != "control" {
 		return ""
 	}
-	switch decision.ControlTools[0] {
-	case "wake_planner", "continue_task":
-		return decision.ControlTools[0]
+	lifecycle := ""
+	seen := map[string]bool{}
+	for _, name := range decision.ControlTools {
+		if seen[name] {
+			return ""
+		}
+		seen[name] = true
+		switch name {
+		case "wake_planner", "continue_task":
+			if lifecycle != "" {
+				return ""
+			}
+			lifecycle = name
+		case "set_goals", "add_intent":
+		default:
+			return ""
+		}
 	}
-	return ""
+	if seen["add_intent"] && !seen["set_goals"] {
+		return ""
+	}
+	return lifecycle
 }
 
 func (s *Server) mainMessageWaitingReason(t *Task, msg *db.MainMessage) string {

@@ -85,7 +85,7 @@ func TestMainLifecycleGateDoesNotReleaseOrdinaryMutations(t *testing.T) {
 	for i, tools := range [][]string{{"continue_task"}, {"set_goals"}, {"continue_task", "set_goals"}} {
 		m := mainLifecycleFixtureMessage(t, task, string(rune('a'+i)), tools)
 		waiting := s.mainMessageWaitingReason(task, m)
-		if (waiting == "") != (i == 0) {
+		if (waiting == "") != (i != 1) {
 			t.Fatalf("wrong lifecycle gate tools=%v reason=%q", tools, waiting)
 		}
 	}
@@ -117,7 +117,7 @@ func TestMainContinueToolActuallyRestartsAndPreservesPlannerInbox(t *testing.T) 
 			if tool.Name == "continue_task" {
 				found = true
 			}
-			if tool.Name == "add_intent" || tool.Name == "set_goals" || tool.Name == "wake_planner" {
+			if tool.Name == "wake_planner" {
 				t.Errorf("unassigned tool exposed: %s", tool.Name)
 			}
 		}

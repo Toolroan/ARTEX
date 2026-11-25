@@ -25,7 +25,7 @@ func routedWorkRequest(d MainRouteDecision) bool {
 		return false
 	}
 	for _, name := range decision.ControlTools {
-		if name == "set_goals" {
+		if name == "set_goals" || name == "add_intent" {
 			return true
 		}
 	}

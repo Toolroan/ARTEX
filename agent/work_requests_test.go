@@ -138,8 +138,20 @@ func TestWorkRequestCreationReusesSameNodesAcrossMainPlannerHandoff(t *testing.T
 func TestWorkRequestSelectionCannotInventAuthorityOrFallback(t *testing.T) {
 	store := guardTaskStore(t)
 	g1, r1 := agentWorkRequestFixture(t, store, "agent-request-first")
+	if err := store.HandoffMainRequest(t.Context(), g1.RequestID, g1.DeliveryToken); err != nil {
+		t.Fatal(err)
+	}
 	g2, r2 := agentWorkRequestFixture(t, store, "agent-request-second")
-	tools := NewToolSet(store, "human")
+	if err := store.HandoffMainRequest(t.Context(), g2.RequestID, g2.DeliveryToken); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.ClaimPlannerMessages(t.Context(), 8)
+	if err != nil || batch == nil || len(batch.Messages) != 2 {
+		t.Fatalf("claim multi-request Planner batch: %+v %v", batch, err)
+	}
+	g1.Owner, g1.DeliveryToken = "planner", batch.Token
+	g2.Owner, g2.DeliveryToken = "planner", batch.Token
+	tools := NewToolSet(store, "planner")
 	ctx := WithWorkRequests(t.Context(), []db.WorkRequestGrant{g1, g2}, []db.WorkRequest{r1, r2})
 	for _, input := range []map[string]any{{"text": "ambiguous request"}, {"text": "forged request", "request_id": r2.ID + 100000, "delivery_token": g2.DeliveryToken}, {"text": "invalid ID", "request_id": 0}, {"text": "invalid type", "request_id": "1"}} {
 		if result := callWorkTool(t, ctx, tools.setGoals(), input); !result.IsError {
@@ -208,12 +220,18 @@ func TestWorkRequestContextAndToolPolicyStayScoped(t *testing.T) {
 		}})
 		opts := agentcore.Options{Tools: trusted}
 		enforceMainTurnPolicy(policyCtx, &opts)
-		if mode == "readonly" && len(opts.Tools) != 0 {
-			t.Fatal("readonly question acquired work writes")
+		if len(opts.Tools) != 4 || workToolByName(t, opts.Tools, "set_goals") == nil {
+			t.Fatal("Main goal/intent/request schemas changed with routing")
 		}
-		if mode == "work_request" && (len(opts.Tools) != 4 || workToolByName(t, opts.Tools, "set_goals") == nil) {
-			t.Fatal("work request lacks restored Main goal/intent tools")
+		for _, tool := range opts.Tools {
+			result, err := tool.Call(policyCtx, json.RawMessage(`{}`), nil)
+			if err != nil || result.IsError != (mode == "readonly") {
+				t.Fatalf("wrong write authority for %s/%s: %+v %v", mode, tool.Name(), result, err)
+			}
 		}
+	}
+	if writes.Load() != 4 {
+		t.Fatal("read-only stable schemas reached write handlers")
 	}
 	withGrant := plannerInstructionOnlyTools(ctx, trusted)
 	if len(withGrant) != 5 {

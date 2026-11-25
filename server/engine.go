@@ -1102,6 +1102,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.budgetStop(ctx, t) {
 			return false
 		}
+		if !t.planningMu.TryLock() {
+			return false // Main notifies after finishing request preparation
+		}
+		defer t.planningMu.Unlock()
 		if !e.beginTaskOperation(t.ID) {
 			return false
 		}
@@ -1117,7 +1121,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			log.Printf("[planner] task %s quiet: work in flight, goals unchanged, edge round skipped", t.ID)
 			return true
 		}
-		batch, batchErr := t.Store.ClaimPlannerMessages(ectx, 8)
+		batch, batchErr := claimPlannerRoundMessages(ectx, t, queuedInstructions, triggers)
 		if batchErr != nil || (queuedInstructions && batch == nil) {
 			return false
 		}

@@ -61,11 +61,14 @@ func TestWorkRequestEnrollmentTracksOnlyNewActionableRouting(t *testing.T) {
 		{Route: "context"}, {Route: "clarify"}, {Route: "action", Owner: "main"}, {Route: "correction", Owner: "planner"},
 		{Route: "control", Owner: "main", DecisionData: json.RawMessage(`{"control_tools":["set_goals"]}`)},
 		{Route: "control", Owner: "main", DecisionData: json.RawMessage(`{"control_tools":["continue_task"]}`)},
+		{Route: "control", Owner: "main", DecisionData: json.RawMessage(`{"control_tools":["continue_task","set_goals"]}`)},
+		{Route: "control", Owner: "main", DecisionData: json.RawMessage(`{"control_tools":["continue_task","set_goals","add_intent"]}`)},
+		{Route: "control", Owner: "main", DecisionData: json.RawMessage(`{"control_tools":["add_intent"]}`)},
 	} {
 		m := createMainMessage(t, s, mainMessageInput(fmt.Sprint("enroll-", i)))
 		m = finishMainRoute(t, s, m.ID, decision)
 		w, err := s.GetWorkRequest(t.Context(), m.ID)
-		want := i >= 2 && i <= 4
+		want := i >= 2 && i != 5
 		if err != nil || (w != nil) != want {
 			t.Fatalf("route %+v request=%+v err=%v", decision, w, err)
 		}

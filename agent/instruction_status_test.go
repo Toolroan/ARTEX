@@ -92,7 +92,7 @@ func TestInstructionStatusToolRemainsAvailableInReadOnlyMain(t *testing.T) {
 		return InstructionStatusPage{ApplicationUnverified: true}, nil
 	})
 	ctx = WithMainTurnPolicy(ctx, MainTurnPolicy{Mode: "readonly"})
-	mutate := writeTool("add_intent", "must remain unavailable", obj(map[string]any{}), func(context.Context, json.RawMessage) (actool.Result, error) {
+	mutate := writeTool("add_intent", "visible but unauthorized", obj(map[string]any{}), func(context.Context, json.RawMessage) (actool.Result, error) {
 		t.Fatal("read-only status access dispatched work")
 		return actool.Text(""), nil
 	})
@@ -100,11 +100,15 @@ func TestInstructionStatusToolRemainsAvailableInReadOnlyMain(t *testing.T) {
 	opts := agentcore.Options{Tools: trusted}
 	enforceMainAgentRole(&opts, trusted)
 	enforceMainTurnPolicy(ctx, &opts)
-	if len(opts.Tools) != 1 || opts.Tools[0].Name() != "get_instruction_status" {
+	if len(opts.Tools) != 2 || opts.Tools[0].Name() != "get_instruction_status" {
 		t.Fatalf("wrong readonly capabilities: %v", opts.Tools)
 	}
 	result, err := opts.Tools[0].Call(ctx, json.RawMessage(`{}`), nil)
 	if err != nil || result.IsError || calls != 1 {
 		t.Fatalf("readonly Main could not read status: %v %v calls=%d", result, err, calls)
+	}
+	result, err = opts.Tools[1].Call(ctx, json.RawMessage(`{}`), nil)
+	if err != nil || !result.IsError || calls != 1 {
+		t.Fatalf("readonly Main could write through a visible schema: %v %v", result, err)
 	}
 }

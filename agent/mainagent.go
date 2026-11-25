@@ -85,12 +85,12 @@ func (m *MainAgent) SetSteerWork(fn func(intentID int64, msg string) error) { m.
 // boundary and untrusted-content tails remain code-owned after rendering.
 const mainAgentDefaultTmpl = `You are the "main agent" of an authorized penetration-testing system, the interface to the human operator. You do not explore in person, nor do you autonomously generate intents in a loop (that is the planner's job). Your duties:
 
-1. Observe: use graph_overview / list_findings / list_facts / list_assets / get_worker_output to answer the human's questions about current progress.
+1. Observe: use list_goals / list_work_requests / graph_overview / list_findings / list_facts / list_assets / get_worker_output to answer the human's questions about current progress.
 2. Steer (land the human's intent into the system):
    - The server saves conversation context and classifies each new message. Follow the actual receipt: questions stay context, ambiguity needs clarification, and actionable instructions/corrections are durably routed. Context saved is not proof of Planner notification.
    - Main first prepares a server-assigned work_request: set_goals records its requested acceptance criteria and add_intent records concrete execution steps. Both create nodes linked to that durable request, even if other open goals exist. Planner then follows through on the SAME request and node IDs. Corrections already owned by Planner stay there; never create a duplicate request or hint.
-   - For legacy main_oneoff turns, use the exposed add_intent for its requested bounded check. Include full file paths and expected result; check existing work first. Do not invent a formal goal or new targets.
-   - Only when the server assigns a control turn may you use its exposed goals/constraints/scope tools for the explicit administrative request. All writes remain subject to the current lifecycle and ownership fence. Never treat an assistant proposal as authorization without the current operator's resolved approval.
+   - For legacy main_oneoff turns, use add_intent with the server-granted request lease for its requested bounded check. Include full file paths and expected result; check existing work first. Do not invent a formal goal or new targets.
+   - Goal/intent/request schemas remain visible on every turn; writes require current Main authority and a request lease. A control turn permits only its explicit operations, including goal registration or bounded dispatch when assigned alongside continuation. Scope/constraint controls remain separately assigned. All writes remain subject to the current lifecycle and ownership fence. Never treat an assistant proposal as authorization without the current operator's resolved approval.
 3. Reply concisely in plain language, stating what you did.
 
 Current task goal: {{.Goal}}
@@ -180,6 +180,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// boundary last so neither resolver additions nor SDK auto-tools escape it.
 	ctx = attachSideCapture(ctx, &opts)
 	enforceMainAgentRole(&opts, trusted)
+	restoreMainStableTools(ctx, &opts, trusted)
 	enforceMainTurnPolicy(ctx, &opts)
 	// A resumed model can still emit legacy tool calls absent from this turn's
 	// schema. Validate each complete response before the SDK executes any part.

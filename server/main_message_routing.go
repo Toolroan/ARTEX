@@ -470,9 +470,13 @@ func (s *Server) mainMutationPolicy(t *Task, msg *db.MainMessage) agent.MainTurn
 	}
 	var mutationMu sync.Mutex
 	var lifecycleCalled bool
+	var lifecycleSucceeded bool
 	policy.Execute = func(ctx context.Context, tool string, input json.RawMessage, run func() (actool.Result, error)) (actool.Result, error) {
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
+		if !agent.MainTurnAllowsWrite(policy, tool) {
+			return actool.Errorf(fmt.Sprintf("This current message does not authorize %s. Goal and intent tools remain available; send an explicit work or goal-registration instruction to use them. Planner-owned instructions must be handled by Planner.", tool)), nil
+		}
 		s.concMu.Lock()
 		defer s.concMu.Unlock()
 		current, err := t.Store.GetMainMessage(ctx, msg.ID)
@@ -489,9 +493,26 @@ func (s *Server) mainMutationPolicy(t *Task, msg *db.MainMessage) agent.MainTurn
 			lifecycleCalled = true
 			// The canonical callback uses the locked scheduler helper. It checks
 			// the specific wake/restart lifecycle instead of the ordinary-write gate.
-			return run()
+			result, runErr := run()
+			var receipt taskControlResult
+			action := "wake"
+			if tool == "continue_task" {
+				action = "restart"
+			}
+			lifecycleSucceeded = runErr == nil && !result.IsError && json.Unmarshal([]byte(result.Flatten()), &receipt) == nil &&
+				receipt.ID == t.ID && receipt.Action == action && receipt.BlockedReason == "" && receipt.Error == "" &&
+				!receipt.Paused && !receipt.Queued && !isTerminalStatus(receipt.Status)
+			return result, runErr
 		}
 		state := t.lifecycleSnapshot()
+		if mainLifecycleTool(current) != "" {
+			if !lifecycleSucceeded {
+				return actool.Errorf("Run the authorized task-control operation first. Goal registration remains saved under this request."), nil
+			}
+			if isTerminalStatus(state.Status) || !s.engine.Started(t.ID) || !s.engine.ReadyFor(t) || s.engine.budgetBlocksClaim(t.ID) {
+				return actool.Errorf("Continuation has not admitted a runnable task. The requested work remains saved; check task status and its blocker before claiming goals were registered."), nil
+			}
+		}
 		if state.Paused || state.Queued || s.engine.IsPaused(t.ID) || s.engine.IsDeleting(t.ID) || s.engine.isSettling(t.ID) {
 			return actool.Errorf("Task lifecycle changed; the request remains saved and no action was started"), nil
 		}
@@ -526,6 +547,20 @@ func (s *Server) runMainMessage(ctx context.Context, t *Task, msg *db.MainMessag
 	s.publishMainRouting(t, msg)
 	if msg.InputSource != "main" {
 		return
+	}
+	if msg.DeliveryOwner == "main" && (msg.DeliveryStatus == "queued" || msg.DeliveryStatus == "inflight") {
+		request, readErr := t.Store.GetWorkRequest(ctx, msg.ID)
+		if readErr != nil {
+			return
+		}
+		if request != nil {
+			// Ordinary Planner rounds can have no inbox lease. Serialize their
+			// entire round with Main preparation as well as the durable DB claims.
+			if !t.planningMu.TryLock() {
+				return // the queued source is picked up by routing recovery
+			}
+			defer func() { t.planningMu.Unlock(); t.Notify() }()
+		}
 	}
 	if msg.RoutingStatus != "routed" {
 		seg := msg.Segment
@@ -563,6 +598,9 @@ func (s *Server) runMainMessage(ctx context.Context, t *Task, msg *db.MainMessag
 	emit := func(rec db.Activity) { rec.MainSeg = &seg; s.engine.emitActivity(t, rec) }
 	gctx := intercept.WithTaskContext(ctx, t.ID, "mainagent", func(a db.Activity) { a.Worker = "mainagent"; emit(a) })
 	gctx = intercept.WithTargetScope(gctx, t.targetScope(intercept.DefaultTargetWaitBound))
+	// All production Main turns are bound, even read-only/lifecycle messages
+	// without a request. Visible tools must never fall back to untracked writes.
+	gctx = agent.WithWorkRequests(gctx, nil, nil)
 	gctx, requestErr := bindWorkRequests(gctx, t, []db.MainMessage{*msg})
 	if requestErr != nil {
 		emit(db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "Request ownership could not be loaded; the message remains saved."})
@@ -615,7 +653,7 @@ func (s *Server) runMainMessage(ctx context.Context, t *Task, msg *db.MainMessag
 				// did not manage to create a goal. Admit its Planner handoff using
 				// the same lifecycle checks as Main's ordinary graph mutations.
 				s.concMu.Lock()
-				if s.mainWaitingReason(t) == "" {
+				if mainLifecycleTool(msg) == "" && s.mainWaitingReason(t) == "" {
 					_, finishErr = s.admitTaskWhenLocked(t, "resume", false)
 				}
 				s.concMu.Unlock()

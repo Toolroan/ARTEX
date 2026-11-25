@@ -151,6 +151,7 @@ func TestMainToolGuardPreservesActualOneOffAndControlFences(t *testing.T) {
 					fences.Add(1)
 					return run()
 				}})
+				ctx = WithWorkRequests(ctx, []db.WorkRequestGrant{{RequestID: 7, Revision: 1, Owner: "main", DeliveryToken: "fixture"}}, nil)
 				opts := agentcore.Options{Provider: provider, SystemPrompt: []string{mainAgentRoleInstructions}, Tools: []actool.CoreTool{mainRoleProbe(name, &calls)}, NonStreaming: nonStreaming, MaxTurns: 3, DisableBackgroundTasks: true, PermissionMode: permission.ModeBypass}
 				enforceMainTurnPolicy(ctx, &opts)
 				opts.Provider = GuardMainToolCalls(opts.Provider)

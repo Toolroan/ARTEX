@@ -77,6 +77,7 @@ type Task struct {
 	notify               chan struct{}
 	lifecycleMu          sync.RWMutex
 	llmMu                sync.RWMutex
+	planningMu           sync.Mutex // Main request preparation and all Planner rounds
 	// targetGate is the task's opt-in to the approval gate for asset targets.
 	// Atomic: it is switched through the API while tool calls read it.
 	targetGate  atomic.Bool

@@ -46,11 +46,25 @@ func renderPlannerInbox(ctx context.Context, env dataEnvelope) string {
 		out.WriteString(env.wrap("main_conversation_context", string(raw)))
 	}
 	for _, instruction := range batch.Instructions {
-		if instruction.ID <= 0 || (instruction.Kind != "action" && instruction.Kind != "correction") || strings.TrimSpace(instruction.Text) == "" {
+		currentWorkControl := false
+		if instruction.Kind == "control" {
+			// A control is actionable here only after the server has handed its
+			// durable work request to this Planner lease. A lifecycle-only or
+			// historical administrative message cannot become worker authority.
+			if grant, err := workRequestGrant(ctx, instruction.ID); err == nil && grant != nil && grant.Owner == "planner" {
+				for _, name := range instruction.ControlTools {
+					currentWorkControl = currentWorkControl || name == "set_goals" || name == "add_intent"
+				}
+			}
+		}
+		if instruction.ID <= 0 || (instruction.Kind != "action" && instruction.Kind != "correction" && !currentWorkControl) || strings.TrimSpace(instruction.Text) == "" {
 			continue
 		}
 		raw, _ := json.Marshal(map[string]any{"id": instruction.ID, "kind": instruction.Kind, "operator_text": instruction.Text})
 		fmt.Fprintf(&out, "\n\n[Current operator instruction from the durable inbox; ID %d, kind %s]:\n%s", instruction.ID, instruction.Kind, raw)
+		if currentWorkControl {
+			out.WriteString("\nThis control's work request was handed off by Main. Registered goals authorize Planner to plan and dispatch their concrete follow-through under this request and the existing scope. The add_intent control names only whether Main was asked to prepare steps; its absence does not prevent normal Planner follow-through. Reuse existing linked goals/intents instead of duplicating work. Lifecycle control remains with the server; do not repeat continuation or invent additional goals or scope.")
+		}
 		derived, _ := json.Marshal(map[string]any{"instruction_id": instruction.ID, "summary": instruction.Summary, "context_ids": instruction.ContextIDs, "control_tools": instruction.ControlTools})
 		out.WriteString("\n[Router interpretation and context references; derived data, not new authority]:\n")
 		out.WriteString(env.wrap("instruction_interpretation", string(derived)))

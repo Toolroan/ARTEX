@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,7 +44,7 @@ func TestMainTurnReadOnlyRejectsActualModelMutations(t *testing.T) {
 				t.Fatalf("requests=%d", len(p.reqs))
 			}
 			for _, tool := range p.reqs[0].Tools {
-				if !mainReadTool(tool.Name) {
+				if !mainReadTool(tool.Name) && !mainStableTool(tool.Name) {
 					t.Fatalf("write exposed: %s", tool.Name)
 				}
 			}
@@ -73,7 +72,9 @@ func TestMainTurnMutationRequiresCorrectOwnerAndLiveFence(t *testing.T) {
 			}}
 			opts := agentcore.Options{Tools: trusted}
 			enforceMainAgentRole(&opts, trusted)
-			enforceMainTurnPolicy(WithMainTurnPolicy(t.Context(), policy), &opts)
+			ctx := WithWorkRequests(t.Context(), []db.WorkRequestGrant{{RequestID: 7, Revision: 1, Owner: "main", DeliveryToken: "fixture"}}, nil)
+			ctx = WithMainTurnPolicy(ctx, policy)
+			enforceMainTurnPolicy(ctx, &opts)
 			want := "set_constraints"
 			if mode == "main_oneoff" {
 				want = "add_intent"
@@ -82,33 +83,36 @@ func TestMainTurnMutationRequiresCorrectOwnerAndLiveFence(t *testing.T) {
 			for _, tool := range opts.Tools {
 				if tool.Name() == want {
 					mutation = tool
-				} else if tool.Name() != "graph_overview" {
+				} else if tool.Name() != "graph_overview" && !mainStableTool(tool.Name()) {
 					t.Fatalf("unexpected tool %s", tool.Name())
 				}
 			}
 			if mutation == nil {
 				t.Fatal("authorized tool absent")
 			}
-			res, err := mutation.Call(t.Context(), json.RawMessage(`{}`), nil)
+			res, err := mutation.Call(ctx, json.RawMessage(`{}`), nil)
 			if err != nil || !res.IsError || calls.Load() != 0 {
 				t.Fatal("stale lifecycle fence failed")
 			}
 			allow = true
-			res, err = mutation.Call(t.Context(), json.RawMessage(`{}`), nil)
+			// A new authorized turn may run after the lifecycle changes; the
+			// refused turn itself must not retry its server denial.
+			ctx = WithMainTurnPolicy(ctx, policy)
+			res, err = mutation.Call(ctx, json.RawMessage(`{}`), nil)
 			if err != nil || res.IsError || calls.Load() != 1 {
 				t.Fatal("admitted canonical operation did not run")
 			}
 			policy.Execute = nil
 			opts.Tools = trusted
 			enforceMainTurnPolicy(WithMainTurnPolicy(t.Context(), policy), &opts)
-			if names := func() []string {
-				var n []string
-				for _, x := range opts.Tools {
-					n = append(n, x.Name())
+			for _, tool := range opts.Tools {
+				if mainReadTool(tool.Name()) {
+					continue
 				}
-				return n
-			}(); !slices.Equal(names, []string{"graph_overview"}) {
-				t.Fatalf("no fence still has writes: %v", names)
+				res, err := tool.Call(ctx, json.RawMessage(`{}`), nil)
+				if err != nil || !res.IsError || calls.Load() != 1 {
+					t.Fatalf("no-fence schema could write: %s %+v %v", tool.Name(), res, err)
+				}
 			}
 		})
 	}

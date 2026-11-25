@@ -17,7 +17,7 @@ import (
 
 func TestMainAgentResumedExecutionHistoryKeepsCurrentRoleAndDelegation(t *testing.T) {
 	for _, delegationEnabled := range []bool{true, false} {
-		t.Run(fmt.Sprintf("delegation_enabled_%t", delegationEnabled), func(t *testing.T) {
+		t.Run(fmt.Sprintf("legacy_catalog_binding_%t", delegationEnabled), func(t *testing.T) {
 			oldPrompt, oldResolve := PromptOverride(), ToolResolve()
 			t.Cleanup(func() { SetPromptOverride(oldPrompt); SetToolResolve(oldResolve) })
 			SetPromptOverride(func(string) (string, bool) {
@@ -34,6 +34,7 @@ func TestMainAgentResumedExecutionHistoryKeepsCurrentRoleAndDelegation(t *testin
 			})
 
 			store := guardTaskStore(t)
+			grant, request := agentWorkRequestFixture(t, store, "resumed-current-work")
 			workDir := t.TempDir()
 			mainDir := filepath.Join(workDir, "tasks", fmt.Sprint(store.ID()), "main")
 			filePath := filepath.Join(mainDir, "uploads", "saved-results.csv")
@@ -77,6 +78,7 @@ func TestMainAgentResumedExecutionHistoryKeepsCurrentRoleAndDelegation(t *testin
 				}
 				return run()
 			}})
+			ctx = WithWorkRequests(ctx, []db.WorkRequestGrant{grant}, []db.WorkRequest{request})
 			ctx = WithInstructionStatusReader(ctx, func(context.Context, []int64) (InstructionStatusPage, error) {
 				return InstructionStatusPage{CurrentMessageID: 42, Items: []InstructionStatus{{MessageID: 42, Route: "action", Owner: "main", Delivery: "main", Reason: "Main owns the bounded one-off request."}}}, nil
 			})
@@ -112,8 +114,8 @@ func TestMainAgentResumedExecutionHistoryKeepsCurrentRoleAndDelegation(t *testin
 					hasDelegation = true
 				}
 			}
-			if hasDelegation != delegationEnabled {
-				t.Fatal("resumption bypassed current delegation binding")
+			if !hasDelegation {
+				t.Fatal("old catalog binding removed the stable delegation schema")
 			}
 			intents, err := store.ListByKind(db.KindIntent, 10)
 			if err != nil {
@@ -138,20 +140,20 @@ func TestMainAgentResumedExecutionHistoryKeepsCurrentRoleAndDelegation(t *testin
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantIntents := 0
-			wantRequests := 1
-			if delegationEnabled {
-				wantIntents = 1
-				wantRequests = 2
-			}
+			wantIntents := 1
+			wantRequests := 2
 			if len(delegation.reqs) != wantRequests {
 				t.Fatalf("delegation requests=%d, want %d", len(delegation.reqs), wantRequests)
 			}
 			if len(intents) != wantIntents {
 				t.Fatalf("persisted worker intents=%d, want %d", len(intents), wantIntents)
 			}
-			if delegationEnabled && !strings.Contains(string(intents[0].Payload), filePath) {
+			if !strings.Contains(string(intents[0].Payload), filePath) {
 				t.Fatal("worker delegation lost the full file context")
+			}
+			linked, err := store.GetWorkRequest(t.Context(), request.ID)
+			if err != nil || linked == nil || len(linked.Nodes) != 1 || linked.Nodes[0].NodeID != intents[0].ID {
+				t.Fatalf("delegation escaped the current durable request: %+v %v", linked, err)
 			}
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatalf("historical execution tool ran: %v", err)

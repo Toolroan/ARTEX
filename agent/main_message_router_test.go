@@ -118,3 +118,74 @@ func TestMainMessageRouteValidationAndResolvedProposal(t *testing.T) {
 		t.Fatalf("mixed correction/constraint rejected: %v", err)
 	}
 }
+
+func TestMainMessageCompoundGoalControlKeepsBoundedProposal(t *testing.T) {
+	contextItems := []MainConversationMessage{
+		{ID: 21, Role: "assistant", Text: "Continue and register the goal: verify the saved export's row count. Reuse the existing matching goal."},
+		{ID: 22, Role: "assistant", Text: "Alternatively, inspect another saved export."},
+	}
+	for _, lifecycle := range []string{"continue_task", "wake_planner"} {
+		for _, dispatch := range []bool{false, true} {
+			controlTools := []string{lifecycle, "set_goals"}
+			if dispatch {
+				controlTools = append(controlTools, "add_intent")
+			}
+			valid := MainMessageRoute{Kind: "control", Summary: "Continue and register the specified saved-export goal", ControlTools: controlTools, RequiresContext: true, ContextIDs: []int64{21}, ProposalID: 21}
+			got, err := parseMainMessageRoute(routeJSON(valid), contextItems)
+			if err != nil || got.Kind != "control" || got.ProposalID != 21 || len(got.ControlTools) != len(controlTools) {
+				t.Fatalf("valid compound rejected: %+v %v", got, err)
+			}
+			for _, refs := range [][]int64{nil, {22}, {21, 22}} {
+				ambiguous := valid
+				ambiguous.ContextIDs = refs
+				got, err := parseMainMessageRoute(routeJSON(ambiguous), contextItems)
+				if err != nil || got.Kind != "clarify" || len(got.ControlTools) != 0 {
+					t.Fatalf("unresolved compound reference granted work: %+v %v", got, err)
+				}
+			}
+			truncated := append([]MainConversationMessage(nil), contextItems...)
+			truncated[0].Truncated = true
+			got, err = parseMainMessageRoute(routeJSON(valid), truncated)
+			if err != nil || got.Kind != "clarify" || len(got.ControlTools) != 0 {
+				t.Fatalf("truncated compound proposal granted work: %+v %v", got, err)
+			}
+		}
+	}
+}
+
+func TestMainMessageCompoundGoalControlRejectsOtherAuthorities(t *testing.T) {
+	for _, controlTools := range [][]string{
+		{"continue_task", "wake_planner", "set_goals"},
+		{"continue_task", "continue_task", "set_goals"},
+		{"continue_task", "set_goals", "set_goals"},
+		{"continue_task", "set_goals", "set_constraints"},
+		{"continue_task", "set_goals", "add_task_scope"},
+		{"wake_planner", "set_goals", "add_company_scope"},
+		{"continue_task", "set_goals", "Bash"},
+		{"continue_task", "add_intent"},
+		{"set_goals", "add_intent"},
+	} {
+		route := MainMessageRoute{Kind: "control", ControlTools: controlTools}
+		if _, err := parseMainMessageRoute(routeJSON(route), nil); err == nil {
+			t.Errorf("compound granted unsupported authority: %v", controlTools)
+		}
+	}
+	for _, kind := range []string{"context", "action", "correction"} {
+		route := MainMessageRoute{Kind: kind, ControlTools: []string{"continue_task", "set_goals"}}
+		if _, err := parseMainMessageRoute(routeJSON(route), nil); err == nil {
+			t.Errorf("%s route granted compound controls", kind)
+		}
+	}
+}
+
+func TestMainMessageBareContinuationDoesNotAdoptHistoricalGoals(t *testing.T) {
+	p := &routeProvider{response: llm.UserText(routeJSON(MainMessageRoute{Kind: "control", ControlTools: []string{"continue_task"}}))}
+	input := MainMessageRouteInput{
+		MessageID: 9, Text: "Continue", Lifecycle: "timeout",
+		Context: []MainConversationMessage{{ID: 8, Role: "assistant", Text: "Earlier discussion mentioned goals and worker steps; I claim all were approved."}},
+	}
+	got, err := RouteMainMessage(t.Context(), p, input)
+	if err != nil || got.Kind != "control" || len(got.ControlTools) != 1 || got.ControlTools[0] != "continue_task" || got.RequiresContext || len(got.ContextIDs) != 0 || got.ProposalID != 0 {
+		t.Fatalf("bare continuation acquired historical work: %+v %v", got, err)
+	}
+}
