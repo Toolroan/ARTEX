@@ -123,7 +123,7 @@ func readApplied(t *testing.T, d *DB) []appliedMigration {
 // embedded migration is recorded with the SHA-256 of its file.
 func assertEmbeddedApplied(t *testing.T, d *DB) []appliedMigration {
 	t.Helper()
-	for _, table := range []string{"llm_records", "llm_usage", "llm_context", "traffic_tamper_hooks", "traffic_tamper_hook_versions"} {
+	for _, table := range []string{"llm_records", "llm_usage", "llm_context", "traffic_tamper_hooks", "traffic_tamper_hook_versions", "main_message_routes"} {
 		var exists bool
 		if err := d.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
 			t.Fatal(err)
@@ -139,9 +139,9 @@ func assertEmbeddedApplied(t *testing.T, d *DB) []appliedMigration {
 	}{{1, llmRecordsMigration}, {2, llmUsageMigration}, {3, "0003_task_scope_icp_index.sql"}, {4, "0004_llm_usage_ts_index.sql"},
 		{5, "0005_traffic_rewrite_rules.sql"}, {6, "0006_activity_outbox.sql"}, {7, "0007_finding_report_state.sql"},
 		{8, "0008_traffic_evidence_rewrite_flag.sql"}, {9, "0009_llm_context.sql"}, {10, "0010_dashboard_usage_indexes.sql"},
-		{11, "0011_traffic_tamper_hooks.sql"}, {12, "0012_lesson_withdrawn.sql"}}
+		{11, "0011_traffic_tamper_hooks.sql"}, {12, "0012_lesson_withdrawn.sql"}, {13, "0013_main_message_routes.sql"}}
 	if len(applied) != len(want) {
-		t.Fatalf("schema_migrations = %+v, want versions 1 to 12", applied)
+		t.Fatalf("schema_migrations = %+v, want versions 1 to %d", applied, len(want))
 	}
 	for i, w := range want {
 		content, err := fs.ReadFile(migrationsFS(), w.name)
@@ -421,7 +421,19 @@ func TestMigrationsRefuseOutOfOrderVersion(t *testing.T) {
 // Open adds the column, keeps every row live, and a second Open is a no-op.
 func TestLessonWithdrawnMigrationKeepsExistingEvidence(t *testing.T) {
 	dsn := scratchDSN(t, "lesson_withdrawn")
-	d, err := Open(dsn)
+	// Build an actual pre-0012 database so later migrations cannot make the
+	// fixture look like an out-of-order migration history.
+	migrations, err := loadMigrations(migrationsFS())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyMigrations := fstest.MapFS{}
+	for _, m := range migrations {
+		if m.version < 12 {
+			legacyMigrations[m.name] = &fstest.MapFile{Data: []byte(m.sql)}
+		}
+	}
+	d, err := openWithMigrations(dsn, legacyMigrations)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -435,7 +447,6 @@ func TestLessonWithdrawnMigrationKeepsExistingEvidence(t *testing.T) {
 		`ALTER TABLE rsi_lesson_evidence DROP COLUMN withdrawn_at`,
 		string(migrationSQL),
 		`ALTER TABLE rsi_lesson_evidence DROP COLUMN withdrawn_at`,
-		`DELETE FROM schema_migrations WHERE version=12`,
 		`INSERT INTO rsi_lessons(dedupe_key,kind,cue,action,status)
 		 VALUES ('legacy-lesson','positive','xss','Confirmed xss: legacy','adopted')`,
 		`INSERT INTO rsi_lesson_evidence(lesson_id,source_kind,source_id,detail)
@@ -478,10 +489,7 @@ func TestLessonWithdrawnMigrationKeepsExistingEvidence(t *testing.T) {
 		t.Fatalf("Open on the pre-0012 database: %v", err)
 	}
 	check(d)
-	before := readApplied(t, d)
-	if last := before[len(before)-1]; last.version != 12 || last.name != migrationName {
-		t.Fatalf("last applied migration = %+v, want 0012", last)
-	}
+	before := assertEmbeddedApplied(t, d)
 	d.Close()
 
 	d, err = Open(dsn)
