@@ -142,7 +142,7 @@ func TestMainAgentRoleRejectsExecutionAndExtensions(t *testing.T) {
 			t.Fatal("in-place resolver replacement changed a trusted handler")
 		}
 	}
-	want := []string{"graph_overview", "list_findings", "node_detail", "expand_digest", "get_worker_output", "get_worker_trace", "search_all_worker_traces", "list_assets", "list_untested_assets", "add_hint", "add_intent", "set_goals", "set_constraints", "add_task_scope", "add_company_scope"}
+	want := []string{"graph_overview", "list_findings", "node_detail", "expand_digest", "get_worker_output", "get_worker_trace", "search_all_worker_traces", "list_assets", "list_untested_assets", "list_hints", "add_hint", "add_intent", "set_goals", "set_constraints", "add_task_scope", "add_company_scope"}
 	slices.Sort(got)
 	slices.Sort(want)
 	if !slices.Equal(got, want) {

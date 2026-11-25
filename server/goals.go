@@ -108,14 +108,19 @@ func (s *Server) admitPausedTask(t *Task) (queued bool, err error) {
 }
 
 func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued bool, err error) {
+	s.concMu.Lock()
+	defer s.concMu.Unlock()
+	return s.admitTaskWhenLocked(t, mode, requirePaused)
+}
+
+// admitTaskWhenLocked also serves fenced Main mutations; caller holds concMu.
+func (s *Server) admitTaskWhenLocked(t *Task, mode string, requirePaused bool) (queued bool, err error) {
 	if t == nil {
 		return false, fmt.Errorf("task not found")
 	}
 	if mode != "bootstrap" {
 		mode = "resume"
 	}
-	s.concMu.Lock()
-	defer s.concMu.Unlock()
 	// Delete installs its barrier under concMu as well. Re-resolve after acquiring
 	// the lock so a request that captured a task pointer before successful deletion
 	// cannot revive that stale handle after StopTask clears its Engine maps.

@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,51 +22,14 @@ func TestPlannerInstructionRouteRequiresAuthentication(t *testing.T) {
 	}
 }
 
-type instructionTestStore struct {
-	err     error
-	written bool
-	text    string
-}
-
-func (s *instructionTestStore) AddNode(kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
-	if kind != db.KindHint || priority != 0 || state != "active" || origin != "human" || len(anchors) != 0 {
-		return 0, errors.New("unexpected instruction metadata")
-	}
-	if s.err != nil {
-		return 0, s.err
-	}
-	s.written, s.text = true, payload["text"].(string)
-	return 42, nil
-}
-
-func TestPlannerInstructionDurableBeforeNotification(t *testing.T) {
-	for _, fail := range []bool{false, true} {
-		store := &instructionTestStore{}
-		if fail {
-			store.err = errors.New("fixture persistence failure")
-		}
-		notified := false
-		id, err := persistPlannerInstruction(store, "What's the status?", func(text string) {
-			if !store.written || text != "What's the status?" {
-				t.Fatal("notification preceded durable user-text save")
-			}
-			notified = true
-		})
-		if fail && (err == nil || notified || id != 0) {
-			t.Fatalf("failed save accepted: id=%d notified=%v err=%v", id, notified, err)
-		}
-		if !fail && (err != nil || !notified || id != 42) {
-			t.Fatalf("save not delivered: id=%d notified=%v err=%v", id, notified, err)
-		}
-	}
+func TestPlannerInstructionTextLimit(t *testing.T) {
 	for _, invalid := range []string{"", " \n ", strings.Repeat("界", maxPlannerInstructionChars+1)} {
-		store := &instructionTestStore{}
-		if _, err := persistPlannerInstruction(store, invalid, nil); err == nil || store.written {
-			t.Fatal("invalid instruction reached persistence")
+		if _, err := validatePlannerInstruction(invalid); err == nil {
+			t.Fatal("invalid instruction accepted")
 		}
 	}
 	if _, err := validatePlannerInstruction(strings.Repeat("界", maxPlannerInstructionChars)); err != nil {
-		t.Fatal("Unicode character limit counted bytes instead of characters")
+		t.Fatal(err)
 	}
 }
 
@@ -143,67 +105,34 @@ func plannerBridgeRequest(s *Server, task *Task, direct bool, text string) *http
 	return w
 }
 
-func TestPlannerInstructionAPIAndEveryMainMessage(t *testing.T) {
+func TestPlannerInstructionAPIUsesTypedQueueAndIdempotency(t *testing.T) {
 	s, task := plannerBridgeFixture(t)
-	for i, item := range []struct {
-		direct bool
-		text   string
-	}{
-		{true, "Correct the current worker's approach"},
-		{false, "What's the status?"},
-		{false, "hint Preserve the previous correction"},
-	} {
-		w := plannerBridgeRequest(s, task, item.direct, item.text)
-		wantStatus := http.StatusOK
-		if item.direct {
-			wantStatus = http.StatusCreated
+	for i := 0; i < 2; i++ {
+		body := `{"text":"Correct the current worker approach","request_id":"same-message","seg":0}`
+		r := httptest.NewRequest(http.MethodPost, "/api/tasks/"+task.ID+"/planner-instructions", strings.NewReader(body))
+		r.SetPathValue("id", task.ID)
+		w := httptest.NewRecorder()
+		s.plannerInstructions(w, r)
+		if w.Code != 201 {
+			t.Fatalf("status %d %s", w.Code, w.Body)
 		}
-		if w.Code != wantStatus {
-			t.Fatalf("request %d: %d %s", i, w.Code, w.Body)
-		}
-		var receipt plannerInstructionDelivery
-		if item.direct {
-			_ = json.Unmarshal(w.Body.Bytes(), &receipt)
-		} else {
-			var response struct {
-				PlannerDelivery plannerInstructionDelivery `json:"planner_delivery"`
-			}
-			_ = json.Unmarshal(w.Body.Bytes(), &response)
-			receipt = response.PlannerDelivery
-		}
-		if receipt.HintID == 0 || receipt.Delivery != "notified" {
-			t.Fatalf("receipt=%+v", receipt)
-		}
-		node, err := task.Store.GetNode(receipt.HintID)
-		if err != nil || node == nil || node.Kind != db.KindHint || node.Origin != "human" {
-			t.Fatalf("saved node=%+v err=%v", node, err)
-		}
-		var payload struct{ Text string }
-		_ = json.Unmarshal(node.Payload, &payload)
-		if payload.Text != item.text {
-			t.Fatalf("stored operator text=%q, want %q", payload.Text, item.text)
-		}
-		triggers := task.drainTriggers()
-		if len(triggers) != 1 || triggers[0].Kind != "hint" || triggers[0].HintOrigin != "human" || len(triggers[0].Hints) != 1 || triggers[0].Hints[0] != item.text {
-			t.Fatalf("triggers=%+v", triggers)
-		}
-		nodes, err := task.Store.ListByKind(db.KindHint, 100)
-		if err != nil || len(nodes) != i+1 {
-			t.Fatalf("duplicate or lost instruction: count=%d err=%v", len(nodes), err)
+		var receipt mainMessageReceipt
+		_ = json.Unmarshal(w.Body.Bytes(), &receipt)
+		if receipt.MessageID == 0 || receipt.Delivery != "queued" {
+			t.Fatalf("receipt %+v", receipt)
 		}
 	}
-	activities, _, err := task.Store.ActivityList(nil, 0, 100)
-	if err != nil {
-		t.Fatal(err)
+	rows, err := task.Store.ListMainMessages(t.Context(), 0, 0, 100)
+	if err != nil || len(rows) != 1 || rows[0].DeliveryStatus != "queued" {
+		t.Fatalf("rows=%+v err=%v", rows, err)
 	}
-	operatorEchoes := 0
-	for _, row := range activities {
-		if row.Worker == "planner" && row.Kind == "user" {
-			operatorEchoes++
-		}
+	hints, err := task.Store.ListByKind(db.KindHint, 100)
+	if err != nil || len(hints) != 0 {
+		t.Fatal("conversation entered standing hints")
 	}
-	if operatorEchoes != 3 {
-		t.Fatalf("Planner user echoes=%d, want exactly the three accepted user messages", operatorEchoes)
+	batch, err := task.Store.ClaimPlannerMessages(t.Context(), 8)
+	if err != nil || batch == nil || len(batch.Messages) != 1 {
+		t.Fatalf("batch=%+v err=%v", batch, err)
 	}
 }
 
@@ -215,10 +144,10 @@ func TestPlannerInstructionPreservesLifecycleAndRejectsUnacceptedMessages(t *tes
 		})
 		before := task.lifecycleSnapshot()
 		w := plannerBridgeRequest(s, task, true, "Preserve lifecycle "+status)
-		var receipt plannerInstructionDelivery
+		var receipt mainMessageReceipt
 		_ = json.Unmarshal(w.Body.Bytes(), &receipt)
 		after := task.lifecycleSnapshot()
-		if w.Code != http.StatusCreated || receipt.Delivery != "saved" || receipt.Reason == "" || after.Status != before.Status || after.Paused != before.Paused || after.Queued != before.Queued {
+		if w.Code != http.StatusCreated || receipt.Delivery != "waiting" || receipt.Reason == "" || after.Status != before.Status || after.Paused != before.Paused || after.Queued != before.Queued {
 			t.Fatalf("state=%s response=%d %s before=%+v after=%+v", status, w.Code, w.Body, before, after)
 		}
 	}
@@ -227,9 +156,9 @@ func TestPlannerInstructionPreservesLifecycleAndRejectsUnacceptedMessages(t *tes
 		t.Fatal(err)
 	}
 	w := plannerBridgeRequest(s, task, true, "No new goal implied")
-	var receipt plannerInstructionDelivery
+	var receipt mainMessageReceipt
 	_ = json.Unmarshal(w.Body.Bytes(), &receipt)
-	if w.Code != http.StatusCreated || receipt.Delivery != "saved" || !strings.Contains(receipt.Reason, "no open goals") {
+	if w.Code != http.StatusCreated || receipt.Delivery != "waiting" || !strings.Contains(receipt.Reason, "no open goals") {
 		t.Fatalf("goalless response=%d %s", w.Code, w.Body)
 	}
 	before, _ := task.Store.ListByKind(db.KindHint, 100)

@@ -27,7 +27,6 @@ import (
 	"github.com/Autumn-27/artex/archivestore"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
-	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
@@ -319,6 +318,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.discoverEmptyMCPsOnStartup()
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
+	go s.runMainRoutingRecovery()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM fallback approval: commands that hit no interception rule go to the model for judgment
 	return s
@@ -934,6 +934,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/chat/status", s.taskChatStatus)
 	mux.HandleFunc("POST /api/tasks/{id}/chat/stop", s.stopChat)
 	mux.HandleFunc("POST /api/tasks/{id}/planner-instructions", s.plannerInstructions)
+	mux.HandleFunc("GET /api/tasks/{id}/main-message-routes", s.mainMessageRoutes)
+	mux.HandleFunc("POST /api/tasks/{id}/main-message-routes/{message}/retry", s.retryMainMessageRoute)
 
 	// --- Admin API (PostgreSQL data source; new database & admin console plan) ---
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.pgDeleteTask)
@@ -4271,139 +4273,7 @@ func (s *Server) newMainSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
-	if t == nil {
-		writeErr(w, 404, "no active task")
-		return
-	}
-	if s.engine.IsDeleting(t.ID) {
-		writeErr(w, 409, "task is being deleted; cannot send a new message")
-		return
-	}
-	// Note: a paused task does not block main-agent conversations. The main-agent orchestration session is independent of the
-	// planner/worker pause; chat continues while paused (pausing only aborts the turn in flight — see control()).
-	var req struct {
-		Message     string           `json:"message"`
-		Attachments []chatAttachment `json:"attachments,omitempty"` // files uploaded via method 1 (paths relative to the task work dir)
-		Seg         *int             `json:"seg,omitempty"`         // target main-session segment; omitted = newest segment
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxPlannerChatBodyBytes)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, 400, err.Error())
-		return
-	}
-	maTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
-	mainDir := filepath.Join(s.m.dir, "tasks", strconv.FormatInt(maTaskID, 10), "main")
-	plannerText, err := mainPlannerInstruction(req.Message, req.Attachments, mainDir)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	agentMessage, ok := s.prepareChatMentionMessage(w, req.Message)
-	if !ok {
-		return
-	}
-	if !s.engine.beginTaskOperation(t.ID) {
-		writeErr(w, http.StatusConflict, "Task is being deleted or the server is draining")
-		return
-	}
-	defer s.engine.decInflight(t.ID)
-	// Admission is serialized with deletion's chat cancellation. Mark every chat
-	// turn busy before its first activity/file write, including rule-mode turns.
-	// If deletion wins the race, the second barrier check rejects this request.
-	s.chatMu.Lock()
-	if s.engine.IsDeleting(t.ID) {
-		s.chatMu.Unlock()
-		writeErr(w, 409, "task is being deleted; cannot send a new message")
-		return
-	}
-	if s.chatBusy[t.ID] {
-		s.chatMu.Unlock()
-		writeErr(w, 409, "the main agent is still processing the previous message, please wait")
-		return
-	}
-	ctx, cancel := context.WithCancelCause(s.ctx)
-	ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: req.Message})
-	s.chatBusy[t.ID] = true
-	s.chatCancel[t.ID] = cancel
-	s.chatMu.Unlock()
-	// Every accepted USER message reaches Planner independently of Main's model
-	// choices. A persistence failure releases the busy state and starts no model.
-	plannerDelivery, err := s.savePlannerInstruction(t, plannerText)
-	if err != nil {
-		s.finishTaskChat(t.ID, cancel)
-		writeErr(w, http.StatusInternalServerError, "Message was not accepted because its Planner instruction could not be saved")
-		return
-	}
-
-	// The turn belongs to whichever main-agent segment the user is chatting in (any
-	// segment is interactive, like the top-level chat conversations). Stamp every
-	// mainagent row with it so this turn's transcript + activity land in that segment.
-	// Missing seg (older clients) falls back to the newest segment.
-	mainSeg := 0
-	if req.Seg != nil && *req.Seg >= 0 {
-		mainSeg = *req.Seg
-	} else {
-		mainSeg, _ = t.Store.CurrentMainSeg()
-	}
-	segPtr := &mainSeg
-
-	// Persist + broadcast the human turn so the main-agent orchestration session survives page
-	// reloads and updates live: the conversation lives in the activity stream as
-	// worker="mainagent" (the per-task activity table, replayed via SSE). With
-	// attachments, the activity's Detail carries {text, attachments} so the transcript
-	// renders attachment cards.
-	humanTurn := userActivityWithAttachments("mainagent", req.Message, req.Attachments)
-	humanTurn.MainSeg = segPtr
-	s.engine.emitActivity(t, humanTurn)
-	var ma *agent.MainAgent
-	if s.taskRuntimeAvailable(t, "mainagent") {
-		ma = s.agentsForTask(t).main
-	}
-	if ma != nil {
-		// Run the agent on a per-turn cancellable ctx (NOT r.Context()): the turn can
-		// take minutes (multi-tool loop), and binding it to the request lifecycle meant
-		// a page reload / proxy timeout cancelled it mid-run ("context canceled"). The
-		// steps + final answer stream back live via SSE (worker="mainagent"), so the
-		// handler returns immediately and the browser never needs to hold the request.
-		go func() {
-			defer func() {
-				s.finishTaskChat(t.ID, cancel)
-			}()
-			// emit every step (thinking/tool_use/tool_result/text/result) so the main
-			// agent session shows its work live, like worker/planner. The final answer
-			// is the captured "result" step — no separate reply emit (would duplicate).
-			emit := func(rec db.Activity) {
-				rec.MainSeg = segPtr
-				s.engine.emitActivity(t, rec)
-			}
-			resume := func() { s.reviveTask(t) } // set_goals added a goal → pulls the task back to running
-			// Give Main absolute attachment paths to include in delegated worker checks.
-			// mainDir = the main agent's run directory (its CWD, tasks/<id>/main), the same call as chatUpload's target dir and the agent itself.
-			mainDir := agent.EnsureRunDir(s.m.dir, maTaskID, 0)
-			agentMsg := composeMainAgentMessage(agentMessage, req.Attachments, mainDir)
-			receipt, _ := json.Marshal(plannerDelivery)
-			agentMsg += "\n\n[Server Planner handoff receipt for this user message]\n" + string(receipt) + "\nThe message is already saved. Notification is not proof that Planner or a worker has acted. Do not duplicate this unchanged message with add_hint."
-			// Tag the turn for the target gate: the task, the "mainagent" lane and the approval scope.
-			gctx := intercept.WithTaskContext(ctx, t.ID, "mainagent", func(a db.Activity) {
-				a.Worker = "mainagent"
-				emit(a)
-			})
-			gctx = intercept.WithTargetScope(gctx, t.targetScope(intercept.DefaultTargetWaitBound))
-			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(gctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, t.TargetGuard.Hooks(), emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
-			s.engine.EndLLMCall(t.ID)
-			if err != nil && ctx.Err() == nil {
-				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "(main agent error: " + err.Error() + ")", MainSeg: segPtr})
-			}
-		}()
-		writeJSON(w, 202, map[string]any{"status": "accepted", "mode": "llm", "planner_delivery": plannerDelivery})
-		return
-	}
-	reply := s.fallbackChat(t, req.Message, plannerDelivery)
-	s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: reply, MainSeg: segPtr})
-	s.finishTaskChat(t.ID, cancel)
-	writeJSON(w, 200, map[string]any{"reply": reply, "mode": "rule", "planner_delivery": plannerDelivery})
+	s.acceptMainMessage(w, r)
 }
 
 func (s *Server) cancelTaskChat(taskID string, cause error) bool {
@@ -4453,31 +4323,6 @@ func (s *Server) stopChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"status": "stopping"})
-}
-
-// fallbackChat is the no-LLM human-steering handler: simple commands + situation summary.
-func (s *Server) fallbackChat(t *Task, msg string, delivery plannerInstructionDelivery) string {
-	m := strings.TrimSpace(msg)
-	lower := strings.ToLower(m)
-	switch {
-	case strings.HasPrefix(m, "intent") || strings.HasPrefix(lower, "intent"):
-		text := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(m, "intent"), "intent"))
-		if _, err := t.Store.AddIntent(map[string]any{"summary": text}, 9, nil, "human"); err != nil {
-			return "The message was saved for Planner, but the direct intent could not be created."
-		}
-		return "Injected one high-priority intent: " + text
-	case strings.HasPrefix(m, "hint") || strings.HasPrefix(lower, "hint"):
-		return fmt.Sprintf("Planner instruction #%d saved for the next eligible planning round.", delivery.HintID)
-	default:
-		assetCounts, _ := s.m.Assets().CountsByType()
-		assets := 0
-		for _, c := range assetCounts {
-			assets += c
-		}
-		fnd, _ := t.Store.ListByKind(db.KindFinding, 1000)
-		fr, _ := t.Store.Frontier(1000)
-		return fmt.Sprintf("(rule mode, no LLM configured) Current situation: assets %d, open intents %d, confirmed findings %d.\nAvailable commands: \"intent ...\" injects an intent, \"hint ...\" leaves the planner a hint.", assets, len(fr), len(fnd))
-	}
 }
 
 func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {

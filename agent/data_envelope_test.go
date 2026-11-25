@@ -136,37 +136,32 @@ func TestDataEnvelopeNoncePerMessage(t *testing.T) {
 	}
 }
 
-// The planner round input frames every derived field kind, keeps the operator
-// goal, the constraints and the operator's hints outside the frames, and labels
-// the operator's hints "operator".
+// Goals and constraints remain authoritative; graph/legacy-trigger hints are
+// historical context even when their recorded origin is "human".
 func TestPlannerInputEnvelopeSplit(t *testing.T) {
 	env := newDataEnvelope()
 	evs, look := envelopeTriggers()
 	cons := "\n\n[Operation constraints]:\nForbidden operations:\n" + envConstraint
 	in := plannerRoundInput("LEAD", plannerSituational(evs, look, envelopeOverview(), env), "", envGoal, cons)
 
-	for _, field := range []string{"worker_output", "finding", "hints", "recent_facts", "finding_list", "cold_digests", "related_tasks", "agent_hints"} {
+	for _, field := range []string{"worker_output", "finding", "hints", "recent_facts", "finding_list", "cold_digests", "related_tasks", "historical_hints"} {
 		if !strings.Contains(in, dataOpenPrefix+env.nonce+" field="+field+"]]") {
 			t.Errorf("no frame for derived field %s", field)
 		}
 	}
 	inside, outside := splitFrames(t, in, env.nonce)
-	for _, derived := range []string{envWorkerOut, envFinding, envAgentHint, envFact, envFindingSum, envDigest, envRelated} {
+	for _, derived := range []string{envWorkerOut, envFinding, envOpHint, envAgentHint, envFact, envFindingSum, envDigest, envRelated} {
 		if !strings.Contains(inside, derived) || strings.Contains(outside, derived) {
 			t.Errorf("derived text %q is not only inside the frames", derived)
 		}
 	}
-	for _, op := range []string{envGoal, envConstraint, envOpHint} {
+	for _, op := range []string{envGoal, envConstraint} {
 		if !strings.Contains(outside, op) || strings.Contains(inside, op) {
 			t.Errorf("operator text %q is not only outside the frames", op)
 		}
 	}
-	if !strings.Contains(outside, "- [operator] The operator sent a message: "+envOpHint) {
-		t.Errorf("operator hint trigger not labelled operator: %q", outside)
-	}
-	opAt, hintAt := strings.Index(outside, "[Operator ("), strings.LastIndex(outside, envOpHint)
-	if opAt < 0 || hintAt < opAt || strings.Contains(outside[opAt:hintAt], "[Counters") {
-		t.Errorf("operator hint is not in the operator block: %q", outside)
+	if !strings.Contains(outside, graphHintsContextNote) {
+		t.Errorf("historical hint context rule missing: %q", outside)
 	}
 	if !strings.Contains(outside, "[Data envelope (code-owned)]") || !strings.Contains(outside, env.nonce) {
 		t.Errorf("envelope intro missing: %q", outside)
@@ -183,12 +178,12 @@ func TestWorkerOverviewEnvelopeSplit(t *testing.T) {
 		}
 	}
 	inside, outside := splitFrames(t, out, env.nonce)
-	for _, derived := range []string{envAgentHint, envFact, envFindingSum, envDigest, envRelated, "probe the login"} {
+	for _, derived := range []string{envOpHint, envAgentHint, envFact, envFindingSum, envDigest, envRelated, "probe the login"} {
 		if !strings.Contains(inside, derived) || strings.Contains(outside, derived) {
 			t.Errorf("derived text %q is not only inside the frames", derived)
 		}
 	}
-	for _, op := range []string{envGoal, envOpHint} {
+	for _, op := range []string{envGoal} {
 		if !strings.Contains(outside, op) {
 			t.Errorf("%q missing outside the frames", op)
 		}

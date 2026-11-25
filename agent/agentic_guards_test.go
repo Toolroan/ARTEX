@@ -254,17 +254,15 @@ func TestAddHintRecordsOrigin(t *testing.T) {
 	}
 }
 
-// renderTriggers names the writer of a hint from its origin; only the main agent
-// is "the human" (#124, F6). The hint case never reads the store. Since F3 a hint
-// not written by the operator is framed as data.
+// Recorded origin remains visible, but every untyped hint is historical context.
 func TestRenderTriggersHintOrigin(t *testing.T) {
 	env := newDataEnvelope()
 	framed := "\n" + env.wrap("hints", "h1") + "\n"
 	for origin, want := range map[string]string{
-		"human":        "- [operator] The operator sent a message: h1",
-		"orchestrator": "- A cross-task orchestration added a strategic hint: " + framed,
-		"worker-3":     "- An agent (worker-3) added a strategic hint: " + framed,
-		"":             "- A source that was not recorded added a strategic hint: " + framed,
+		"human":        "- The operator added recorded guidance/context:" + framed,
+		"orchestrator": "- A cross-task orchestration added recorded guidance/context:" + framed,
+		"worker-3":     "- An agent (worker-3) added recorded guidance/context:" + framed,
+		"":             "- A source that was not recorded added recorded guidance/context:" + framed,
 	} {
 		got := renderTriggers([]TriggerEvent{{Kind: "hint", Hints: []string{"h1"}, HintOrigin: origin}}, env, triggerLookup{})
 		if !strings.Contains(got, want) || strings.Contains(got, "The human (main agent)") {
@@ -272,7 +270,7 @@ func TestRenderTriggersHintOrigin(t *testing.T) {
 		}
 	}
 	got := renderTriggers([]TriggerEvent{{Kind: "hint", Hints: []string{"h1", "h2"}, HintOrigin: "orchestrator"}}, env, triggerLookup{})
-	if !strings.Contains(got, "- A cross-task orchestration added 2 strategic hints: \n"+env.wrap("hints", "h1; h2")) {
+	if !strings.Contains(got, "- A cross-task orchestration added recorded guidance/context:\n"+env.wrap("hints", "h1; h2")) {
 		t.Errorf("batch: got %q", got)
 	}
 }

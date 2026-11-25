@@ -16,7 +16,7 @@ func TestPlannerTriggerBatchPrioritizesHandoffAndPreservesLaterArrivals(t *testi
 			task.pendingTriggers = []agent.TriggerEvent{{Kind: "done", IntentID: 1}}
 			task.NotifyHint(origin, []string{"first correction"})
 			batch, skipped := takePlannerTriggers(task, true)
-			if skipped != (origin != "human" && origin != "mainagent") || len(batch) != 2 {
+			if !skipped || len(batch) != 2 {
 				t.Fatalf("batch=%#v skipped=%v", batch, skipped)
 			}
 			if batch[1].HintOrigin != origin {
@@ -29,7 +29,7 @@ func TestPlannerTriggerBatchPrioritizesHandoffAndPreservesLaterArrivals(t *testi
 				t.Fatal("detached trigger batch changed")
 			}
 			next, skipped := takePlannerTriggers(task, true)
-			if skipped || len(next) != 1 || next[0].Hints[0] != "later correction" {
+			if !skipped || len(next) != 1 || next[0].Hints[0] != "later correction" {
 				t.Fatalf("later arrival lost: %#v", next)
 			}
 		})

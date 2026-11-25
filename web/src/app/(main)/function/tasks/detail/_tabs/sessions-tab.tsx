@@ -50,9 +50,17 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
-import { api, sseUrl, type PlannerDelivery } from "@/lib/api";
+import { intlLocale, t } from "@/i18n";
+import { api, type MainRoutingMode, type PlannerDelivery, sseUrl } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
+import {
+  type RoutingRequest,
+  recentRoutingReceipts,
+  routingDeliveryLabel,
+  routingRequestFor,
+} from "@/lib/main-message-routing";
 import { MOCK } from "@/lib/mock/enabled";
+import { setVisibleInterval } from "@/lib/polling";
 import { isBtwCommand } from "@/lib/side-questions";
 import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
 import type {
@@ -69,8 +77,6 @@ import type {
   TokenTotal,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { setVisibleInterval } from "@/lib/polling";
-import { intlLocale, t } from "@/i18n";
 
 // resolutionLabel names the LLM a session runs on. The badge shows this alone and
 // keeps the model id in its tooltip. Env-backed configs can arrive without a name,
@@ -103,11 +109,14 @@ const MAX_KEEP = 4000; // per-session in-memory cap; older pages re-fetched on s
 const STREAM_WINDOW_MS = 5000; // "live" = activity seen within this window
 const MAX_WORKER_MESSAGE_CHARS = 4000;
 const MAX_PLANNER_MESSAGE_CHARS = 20000;
+const routingModeDescriptions: Record<MainRoutingMode, string> = {
+  auto: "Main routes actionable requests; discussion stays as context.",
+  context: "Discussion stays as context without waking Planner.",
+  instruction: "Send an explicit instruction to Planner; application is tracked separately.",
+};
 
 function plannerDeliveryLabel(receipt: PlannerDelivery): string {
-  return receipt.delivery === "notified"
-    ? t("Saved instruction #{id}; Planner notified for its next round.", { id: receipt.hint_id })
-    : t("Saved instruction #{id} for the next eligible Planner round.", { id: receipt.hint_id });
+  return t(routingDeliveryLabel(receipt));
 }
 
 function newWorkerMessageRequestID(): string {
@@ -561,7 +570,19 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const [workerMessageSending, setWorkerMessageSending] = React.useState(false);
   const [plannerMessage, setPlannerMessage] = React.useState("");
   const [plannerMessageSending, setPlannerMessageSending] = React.useState(false);
-  const [plannerReceipt, setPlannerReceipt] = React.useState<PlannerDelivery | null>(null);
+  const [routingMode, setRoutingMode] = React.useState<MainRoutingMode>("auto");
+  const [routingReceipts, setRoutingReceipts] = React.useState<{ scope: string; items: PlannerDelivery[] }>({
+    scope: "",
+    items: [],
+  });
+  const [routingUnavailable, setRoutingUnavailable] = React.useState(false);
+  const [retryingRoute, setRetryingRoute] = React.useState<number | null>(null);
+  const routingVersionRef = React.useRef(0);
+  const mainRequestRef = React.useRef<RoutingRequest | null>(null);
+  const plannerRequestRef = React.useRef<RoutingRequest | null>(null);
+  const mainSendingRef = React.useRef(false);
+  const plannerSendingRef = React.useRef(false);
+  const routingRetryRef = React.useRef(false);
   // Method 1, file upload: chosen attachments (already landed in the task work dir uploads/) are sent with the next message.
   const [attachments, setAttachments] = React.useState<ChatAttachment[]>([]);
   const [uploading, setUploading] = React.useState(false);
@@ -1311,6 +1332,65 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const activeSettled =
     !!activeLast && (activeLast.kind === "result" || (activeLast.kind === "text" && activeLast.is_error));
   const mainBusy = isMain && (sending || (!activeSettled && (mainChatRunning ?? recentLive(activeKey))));
+  const routingSeg = isMain ? (active.seg ?? 0) : currentSeg;
+  const routingScope = `${taskId}:${routingSeg}`;
+  const visibleRoutingReceipts = routingReceipts.scope === routingScope ? routingReceipts.items : [];
+  React.useEffect(() => {
+    if (!isMain && !isPlanner) return;
+    let alive = true;
+    let loading = false;
+    setRoutingUnavailable(false);
+    const refresh = async () => {
+      if (loading || document.visibilityState === "hidden") return;
+      loading = true;
+      const version = routingVersionRef.current;
+      try {
+        const { items } = await api.mainMessageRoutes(taskId, routingSeg);
+        if (alive && version === routingVersionRef.current) {
+          setRoutingReceipts({ scope: routingScope, items: recentRoutingReceipts(items ?? []) });
+          setRoutingUnavailable(false);
+        }
+      } catch {
+        if (alive && version === routingVersionRef.current) setRoutingUnavailable(true);
+      } finally {
+        loading = false;
+      }
+    };
+    void refresh();
+    const cleanup = setVisibleInterval(refresh, 3000);
+    return () => {
+      alive = false;
+      cleanup();
+    };
+  }, [taskId, routingSeg, routingScope, isMain, isPlanner]);
+
+  function rememberRoutingReceipt(receipt: PlannerDelivery, scope: string, text?: string) {
+    routingVersionRef.current++;
+    setRoutingReceipts((previous) => ({
+      scope,
+      items: recentRoutingReceipts([
+        { ...receipt, text: receipt.text ?? text },
+        ...(previous.scope === scope ? previous.items : []),
+      ]),
+    }));
+  }
+
+  function retryRouting(receipt: PlannerDelivery) {
+    if (receipt.delivery !== "routing_failed" || routingRetryRef.current) return;
+    routingRetryRef.current = true;
+    setRetryingRoute(receipt.message_id);
+    const scope = routingScope;
+    api
+      .retryMainMessageRoute(taskId, receipt.message_id)
+      .then((result) => rememberRoutingReceipt(result, scope, receipt.text))
+      .catch((error) => {
+        toast.error(t("Send failed: {error}", { error: (error as Error).message || t("please retry later") }));
+      })
+      .finally(() => {
+        routingRetryRef.current = false;
+        setRetryingRoute(null);
+      });
+  }
   // In the collapsed state (mobile) the title bar replaces the whole list: it shows the current session name + the total unread of other sessions,
   // otherwise once collapsed you neither know which session you are viewing nor see new messages elsewhere.
   const activeDisplayTitle = (active.role === "worker" ? sessionMeta.get(active.id)?.title : "") || active.title;
@@ -1529,7 +1609,24 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     const text = input.trim();
     const atts = attachments;
     if (side.handleCommand(text, () => setInput(""))) return;
-    if ((!text && atts.length === 0) || sending || mainBusy) return;
+    if ((!text && atts.length === 0) || mainSendingRef.current || mainBusy) return;
+    let request: RoutingRequest;
+    try {
+      request = routingRequestFor(mainRequestRef.current, {
+        taskId,
+        seg: active.seg ?? 0,
+        channel: "main",
+        text,
+        mode: routingMode,
+        attachments: atts,
+      });
+    } catch {
+      toast.error(t("Secure request IDs are unavailable. Reload this page before sending."));
+      return;
+    }
+    mainRequestRef.current = request;
+    mainSendingRef.current = true;
+    const scope = routingScope;
     // No optimistic echo: the backend persists+broadcasts the human turn before it
     // returns, so it streams back over SSE (worker="mainagent") with its real DB
     // seq — the transcript renders it from server data like every other step. Clear
@@ -1539,39 +1636,63 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     setSending(true);
     chatStatusRequestRef.current++;
     api
-      .chat(text, taskId, atts.length > 0 ? atts : undefined, active.seg ?? 0)
+      .chat(text, taskId, atts.length > 0 ? atts : undefined, active.seg ?? 0, request.requestId, routingMode)
       .then(({ mode, planner_delivery }) => {
         chatStatusRequestRef.current++;
         setMainChatRunning(mode === "llm");
-        if (planner_delivery) setPlannerReceipt(planner_delivery);
+        mainRequestRef.current = null;
+        if (planner_delivery) rememberRoutingReceipt(planner_delivery, scope, text);
       })
       .catch((e) => {
         setInput(text); // restore so the user doesn't lose their text / attachments
         setAttachments(atts);
         toast.error(t("Send failed: {error}", { error: (e as Error).message || t("please retry later") }));
       })
-      .finally(() => setSending(false));
+      .finally(() => {
+        mainSendingRef.current = false;
+        setSending(false);
+      });
   }
 
   function sendPlannerMessage() {
     const text = plannerMessage.trim();
-    if (!text || plannerMessageSending) return;
+    if (!text || plannerSendingRef.current) return;
     if (Array.from(text).length > MAX_PLANNER_MESSAGE_CHARS) {
       toast.error(t("Messages cannot exceed {count} characters", { count: MAX_PLANNER_MESSAGE_CHARS }));
       return;
     }
+    let request: RoutingRequest;
+    try {
+      request = routingRequestFor(plannerRequestRef.current, {
+        taskId,
+        seg: currentSeg,
+        channel: "planner",
+        text,
+        mode: "instruction",
+      });
+    } catch {
+      toast.error(t("Secure request IDs are unavailable. Reload this page before sending."));
+      return;
+    }
+    plannerRequestRef.current = request;
+    plannerSendingRef.current = true;
     setPlannerMessageSending(true);
+    const scope = `${taskId}:${currentSeg}`;
     api
-      .sendPlannerInstruction(taskId, text)
+      .sendPlannerInstruction(taskId, text, request.requestId, currentSeg)
       .then((receipt) => {
         setPlannerMessage("");
-        setPlannerReceipt(receipt);
+        plannerRequestRef.current = null;
+        rememberRoutingReceipt(receipt, scope, text);
         toast.success(plannerDeliveryLabel(receipt));
       })
       .catch((error) => {
         toast.error(t("Send failed: {error}", { error: (error as Error).message || t("please retry later") }));
       })
-      .finally(() => setPlannerMessageSending(false));
+      .finally(() => {
+        plannerSendingRef.current = false;
+        setPlannerMessageSending(false);
+      });
   }
 
   function sendWorkerChat() {
@@ -1987,13 +2108,72 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 )}
               </div>
             </ScrollArea>
+            {(isMain || isPlanner) && (visibleRoutingReceipts.length > 0 || routingUnavailable) && (
+              <div className="space-y-2 border-t bg-muted/20 px-3 py-2 text-xs" aria-live="polite">
+                {visibleRoutingReceipts.map((receipt) => (
+                  <div key={receipt.message_id || receipt.hint_id} className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="shrink-0 tabular-nums text-muted-foreground">
+                        #{receipt.message_id || receipt.hint_id}
+                      </span>
+                      <span
+                        className={cn(
+                          "min-w-0 flex-1",
+                          receipt.delivery === "routing_failed" && "text-destructive",
+                          receipt.delivery === "needs_review" && "text-amber-700 dark:text-amber-400",
+                        )}
+                      >
+                        {plannerDeliveryLabel(receipt)}
+                      </span>
+                      {receipt.delivery === "routing_failed" && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 shrink-0 px-2 text-xs"
+                          onClick={() => retryRouting(receipt)}
+                          disabled={retryingRoute !== null}
+                        >
+                          {retryingRoute === receipt.message_id && <Loader2Icon className="size-3 animate-spin" />}
+                          {t("Retry routing")}
+                        </Button>
+                      )}
+                    </div>
+                    {receipt.text && (
+                      <p className="mt-0.5 truncate text-muted-foreground" title={receipt.text}>
+                        {receipt.text}
+                      </p>
+                    )}
+                    {receipt.reason && (
+                      <p className="mt-0.5 line-clamp-2 text-muted-foreground" title={receipt.reason}>
+                        {receipt.reason}
+                      </p>
+                    )}
+                  </div>
+                ))}
+                {routingUnavailable && (
+                  <p className="text-muted-foreground">
+                    {t("Routing status unavailable; showing the last known receipts.")}
+                  </p>
+                )}
+              </div>
+            )}
             {isMain ? (
               <div className="border-t p-3">
-                <p className="mb-2 text-xs text-muted-foreground" role="status">
-                  {plannerReceipt
-                    ? plannerDeliveryLabel(plannerReceipt)
-                    : t("Every message you send to Main is also shared with Planner.")}
-                </p>
+                <label className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+                  {t("Message routing")}
+                  <select
+                    aria-label={t("Message routing")}
+                    className="h-7 rounded-md border bg-background px-2 text-foreground"
+                    value={routingMode}
+                    disabled={sending}
+                    onChange={(event) => setRoutingMode(event.target.value as MainRoutingMode)}
+                  >
+                    <option value="auto">{t("Auto")}</option>
+                    <option value="context">{t("Discuss only")}</option>
+                    <option value="instruction">{t("Send to Planner")}</option>
+                  </select>
+                </label>
+                <p className="mb-2 text-xs text-muted-foreground">{t(routingModeDescriptions[routingMode])}</p>
                 {attachments.length > 0 && (
                   <div className="mb-2 flex flex-wrap gap-1.5">
                     {attachments.map((a) => (
@@ -2091,9 +2271,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             ) : isPlanner ? (
               <div className="border-t p-3">
                 <p className="mb-2 text-xs text-muted-foreground" role="status">
-                  {plannerReceipt
-                    ? plannerDeliveryLabel(plannerReceipt)
-                    : t("Send corrections directly to Planner, including while Main is busy.")}
+                  {t("Send corrections directly to Planner, including while Main is busy.")}
                 </p>
                 {taskPaused && (
                   <p className="mb-2 text-xs text-muted-foreground">

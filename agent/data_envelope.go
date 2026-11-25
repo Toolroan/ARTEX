@@ -91,40 +91,31 @@ func renderWorkerIntentAssets(assets any, env dataEnvelope) string {
 		env.wrap("intent_assets", string(js))
 }
 
-// operatorHintOrigin is the hint origin written by the operator: the main-agent
-// chat and the no-LLM steering fallback store "human" (see addOneHint).
+// operatorHintOrigin is a recorded legacy origin, not proof that a graph hint is
+// a current operator instruction. Historical Main messages used the same label.
 const operatorHintOrigin = "human"
 
 // agentCredentialSource marks credentials written by an agent via save_task_credential.
 const agentCredentialSource = "agent"
 
-// renderOverviewSections splits a graph_overview snapshot by origin for a user
-// message: the operator block (task, goal nodes, the operator's own hints)
-// outside the envelope, the counters and the structured intent fields as plain
-// JSON, then the intent summaries, each derived field and the hints/credentials
-// of agent origin in their own frame. Pure: it reads only data and never modifies
-// it. Empty on a marshal error.
+// renderOverviewSections keeps the task and goal nodes outside the envelope and
+// frames every graph hint as historical context, regardless of recorded origin.
+// Typed Planner instructions are delivered separately; rereading a graph hint
+// must never promote old conversation into a fresh instruction. Counters and
+// structured intent fields stay plain; derived text stays framed. Pure: it reads
+// only data and never modifies it. Empty on a marshal error.
 func renderOverviewSections(data map[string]any, env dataEnvelope) string {
 	operator := map[string]any{}
 	rest := map[string]any{}
 	derived := map[string]any{}
-	var agentHints []map[string]any
+	var historicalHints []map[string]any
 	var agentCreds []map[string]any
 	for k, v := range data {
 		switch k {
 		case "task", "goals":
 			operator[k] = v
 		case "hints":
-			hs, _ := v.([]map[string]any)
-			own := make([]map[string]any, 0, len(hs))
-			for _, h := range hs {
-				if h["origin"] == operatorHintOrigin {
-					own = append(own, h)
-				} else {
-					agentHints = append(agentHints, h)
-				}
-			}
-			operator[k] = own
+			historicalHints, _ = v.([]map[string]any)
 		case "stagnation_warning":
 			derived[k] = v
 		case "task_credentials":
@@ -187,7 +178,7 @@ func renderOverviewSections(data map[string]any, env dataEnvelope) string {
 		head string
 		v    map[string]any
 	}{
-		{"\n\n[Operator (set by the operator: the task and its goal, the goal nodes, and the operator's own hints; these define the work)]:\n", operator},
+		{"\n\n[Operator (the task and its goal, and the goal nodes; these define the work)]:\n", operator},
 		{"\n\n[Counters, intents and coverage]:\n", rest},
 	} {
 		js, err := json.Marshal(sec.v)
@@ -209,9 +200,10 @@ func renderOverviewSections(data map[string]any, env dataEnvelope) string {
 	if _, ok := derived["stagnation_warning"]; ok {
 		fields = append(fields, "stagnation_warning")
 	}
-	if len(agentHints) > 0 {
-		derived["agent_hints"] = agentHints
-		fields = append(fields, "agent_hints")
+	if len(historicalHints) > 0 {
+		b.WriteString("\n\n[Historical graph hints]:\n" + graphHintsContextNote)
+		derived["historical_hints"] = historicalHints
+		fields = append(fields, "historical_hints")
 	}
 	if len(agentCreds) > 0 {
 		derived["agent_credentials"] = agentCreds

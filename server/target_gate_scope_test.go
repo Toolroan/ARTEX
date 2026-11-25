@@ -248,7 +248,7 @@ func (f *targetScopeFixture) mainAgentTurn(t *testing.T, task *Task) scopeProbe 
 	f.s.taskAgents[task.ID] = &taskAgentBundle{main: agent.NewMainAgent(probe, "test-model", f.m.dir, nil, 0, 3)}
 	f.s.taskAgentMu.Unlock()
 	rec := httptest.NewRecorder()
-	f.s.chat(rec, httptest.NewRequest("POST", "/api/chat?task="+task.ID, strings.NewReader(`{"message":"status?"}`)))
+	f.s.chat(rec, httptest.NewRequest("POST", "/api/chat?task="+task.ID, strings.NewReader(`{"message":"status?","routing_mode":"context"}`)))
 	if rec.Code != 202 {
 		t.Fatalf("chat status = %d, want 202: %s", rec.Code, rec.Body.String())
 	}

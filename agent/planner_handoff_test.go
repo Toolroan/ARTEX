@@ -22,7 +22,7 @@ func TestPlannerOperatorHandoffSurvivesSavedPrompt(t *testing.T) {
 	SetPromptOverride(func(string) (string, bool) { return "legacy saved prompt", true })
 	t.Cleanup(func() { SetPromptOverride(old) })
 	system := plannerSystem("fixture", "/data", "/work")
-	if !strings.Contains(system, plannerOperatorHandoff) || !strings.Contains(system, "steer_work") || !strings.Contains(system, "A question alone does not authorize new work") {
+	if !strings.Contains(system, plannerOperatorHandoff) || !strings.Contains(system, "steer_work") || !strings.Contains(system, "Status questions and ordinary conversation do not authorize new work") || !strings.Contains(system, "Only the current typed inbox block") {
 		t.Fatal("saved prompt displaced operator handoff or question handling")
 	}
 }

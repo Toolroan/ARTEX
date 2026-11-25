@@ -93,6 +93,7 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 		{`DELETE FROM task_llm_profiles WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_scope WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_constraints WHERE exploration_id=$1`, []any{expID}},
+		{`DELETE FROM main_message_routes WHERE exploration_id=$1`, []any{expID}},
 		{`DELETE FROM activity WHERE exploration_id=$1`, []any{expID}},
 		{`DELETE FROM exploration_nodes WHERE exploration_id=$1`, []any{expID}},
 	} {
@@ -242,10 +243,18 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	}
 	// Insert graph rows in foreign-key order. The archived stub has no graph rows,
 	// so an ID conflict signals external corruption and must stop the restore.
-	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity"} {
+	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity", "main_message_routes"} {
 		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
+	}
+	// Restored leases cannot belong to a live process. Routing is tool-free and
+	// retryable; previously inflight effects require review instead of replay.
+	if _, err := tx.Exec(`UPDATE main_message_routes SET routing_status=CASE WHEN attempts<$2 THEN 'pending' ELSE 'failed' END,routing_token='',routing_until=NULL,retry_after=now(),last_error='Routing was interrupted by archive',updated_at=now() WHERE exploration_id=$1 AND routing_status='running'`, expID, MainRoutingMaxAttempts); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`UPDATE main_message_routes SET delivery_status='needs_review',delivery_token='',delivery_until=NULL,last_error='Delivery was interrupted by archive; review existing effects before retrying',updated_at=now() WHERE exploration_id=$1 AND delivery_status='inflight'`, expID); err != nil {
+		return nil, err
 	}
 	if warning, err := restoreTaskRelations(tx, taskID, remappedTables["task_relations"]); err != nil {
 		return nil, err
@@ -401,6 +410,7 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 		"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
 		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
 		"side_question_sessions": true, "side_question_requests": true,
+		"main_message_routes": true,
 	}
 	if !allowed[table] {
 		return fmt.Errorf("archive restore table %q is not allowed", table)

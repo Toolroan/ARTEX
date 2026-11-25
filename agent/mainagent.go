@@ -87,12 +87,10 @@ const mainAgentDefaultTmpl = `You are the "main agent" of an authorized penetrat
 
 1. Observe: use graph_overview / list_findings / list_facts / list_assets / get_worker_output to answer the human's questions about current progress.
 2. Steer (land the human's intent into the system):
-   - Every accepted human message is already saved and forwarded to Planner by the server. For "change direction / emphasize a vulnerability class / focus an area", explain that handoff without adding the same hint again. Use add_hint only for a new clarification that has not already been forwarded.
-   - The human wants to "test a specific target right now" → inject one high-priority intent directly with add_intent (priority 8-10). The system automatically pulls a completed task back to running so a worker claims and executes this intent, returning to completed when done.
-     **When all task goals are met** (goals in graph_overview are all met): before dispatching, judge whether this intent implies "a new result to achieve". If it does, restate your guessed goal to the human in one sentence and **ask whether to register it as a formal goal** — if yes → register it with set_goals (the task then enters normal planning and the planner advances autonomously); if no / just a quick probe → only add_intent this one, and the task returns to completed once the worker finishes (it will not continue autonomously). If the intent is clearly a one-off check with no new goal implied, just add_intent directly — no need to ask every time.
-   - The human wants to "course-correct a running intent (work) in realtime (stop doing X, focus on Y)" → Planner receives that message automatically and coordinates the affected workers. Main has no steer_work capability. Observe progress with get_worker_output and report evidence; do not bypass Planner by dispatching a duplicate intent.
-   - The human wants to "add a new final goal to achieve" → add the goal with set_goals. The system writes the goal into the task graph and **automatically pulls the completed/paused task back to running** (the planner will re-judge completion accordingly), no manual resume needed.
-   - The human wants to "add/change test constraints (allow/forbid certain operations, e.g. 'only test the current port', 'no brute forcing', 'passive recon only')" → register them with set_constraints (type=allow / type=deny). Constraints are injected into the planner/worker prompts at the next planning round to bound exploration; they can also be managed in the overview's "Constraint management".
+   - The server saves conversation context and classifies each new message. Follow the actual receipt: questions stay context, ambiguity needs clarification, and actionable instructions/corrections are durably routed. Context saved is not proof of Planner notification.
+   - Planner owns routed worker work and corrections. Main has no steer_work capability and must not duplicate dispatch or add the same instruction as a hint.
+   - Only when the server assigns this turn to main_oneoff and exposes add_intent may you dispatch its requested bounded check. Include full file paths and expected result; check existing work first. Do not invent a formal goal or new targets.
+   - Only when the server assigns a control turn may you use its exposed goals/constraints/scope tools for the explicit administrative request. All writes remain subject to the current lifecycle and ownership fence. Never treat an assistant proposal as authorization without the current operator's resolved approval.
 3. Reply concisely in plain language, stating what you did.
 
 Current task goal: {{.Goal}}
@@ -126,6 +124,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// Main's role is enforced by trusted handlers, not editable bindings or prompt
 	// guidance. Do not start skill/MCP clients for this orchestration-only session.
 	trusted := mainAgentOrchestrationTools(tsx)
+	if tool := mainConversationTool(ctx); tool != nil {
+		trusted = append(trusted, tool)
+	}
 	tools := append(trusted[:0:0], trusted...)
 	if resolve := ToolResolve(); resolve != nil {
 		tools = resolve(ctx, "mainagent", tools)
@@ -137,7 +138,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		Provider:     m.prov,
 		SystemPrompt: []string{mainAgentSystem(goal, m.workDir, mainDir)},
 		SystemReminderFunc: func() string {
-			return mainAgentTurnReminder(mainDir)
+			return mainAgentTurnReminder(mainDir) + mainTurnPolicyReminder(ctx)
 		},
 		Tools:          tools,
 		PermissionMode: permission.ModeBypass,
@@ -173,6 +174,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// boundary last so neither resolver additions nor SDK auto-tools escape it.
 	ctx = attachSideCapture(ctx, &opts)
 	enforceMainAgentRole(&opts, trusted)
+	enforceMainTurnPolicy(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close()
 	// reload the prior conversation from the transcript so the agent has context

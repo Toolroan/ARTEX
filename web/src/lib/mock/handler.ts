@@ -2,6 +2,7 @@
 // Unmatched routes always return safe defaults ([] / {} / {ok:true}) so no page ever crashes.
 // Only entered via the http() short-circuit in api.ts when NEXT_PUBLIC_MOCK=1.
 
+import type { PlannerDelivery } from "../api";
 import {
   classifyCompanyScopeLine,
   companyScopeRuleError,
@@ -50,7 +51,78 @@ const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
-let mockPlannerInstructionId = 10000;
+let mockPlannerInstructionId = 10002;
+const mockMessageRoutes: {
+  taskId: string;
+  seg: number;
+  requestId: string;
+  fingerprint: string;
+  receipt: PlannerDelivery;
+}[] = [
+  {
+    taskId: "t-acme-web",
+    seg: 0,
+    requestId: "fixture-context",
+    fingerprint: "fixture-context",
+    receipt: { message_id: 10001, route: "context", delivery: "context", text: "Synthetic status question" },
+  },
+  {
+    taskId: "t-acme-web",
+    seg: 0,
+    requestId: "fixture-instruction",
+    fingerprint: "fixture-instruction",
+    receipt: {
+      message_id: 10002,
+      route: "correction",
+      delivery: "queued",
+      text: "Synthetic correction: keep the existing scope",
+    },
+  },
+];
+
+function acceptMockMainMessage(taskId: string, body: Record<string, unknown>, directPlanner = false): PlannerDelivery {
+  const task = mockTasks.find((item) => item.id === taskId);
+  if (!task) throw new Error("task not found");
+  const text = String(directPlanner ? (body.text ?? "") : (body.message ?? "")).trim();
+  const mode = directPlanner ? "instruction" : String(body.routing_mode ?? "auto");
+  const seg = Number(body.seg ?? 0);
+  const requestId = String(body.request_id ?? "");
+  if (!requestId || (!text && !(body.attachments as unknown[])?.length) || Array.from(text).length > 20000) {
+    throw new Error("Invalid message or request ID");
+  }
+  if (!["auto", "context", "instruction"].includes(mode) || !Number.isInteger(seg) || seg < 0) {
+    throw new Error("Invalid routing mode or segment");
+  }
+  const fingerprint = JSON.stringify({ text, mode, seg, directPlanner, attachments: body.attachments ?? [] });
+  const existing = mockMessageRoutes.find((item) => item.taskId === taskId && item.requestId === requestId);
+  if (existing) {
+    if (existing.fingerprint !== fingerprint) throw new Error("Request ID already belongs to a different message");
+    return existing.receipt;
+  }
+  // Demo-only fixtures. Real Auto routing is performed by the backend router.
+  const instruction =
+    mode === "instruction" || (mode === "auto" && /^(please|correct|change|use|stop|retry|inspect)\b/i.test(text));
+  const failed = mode === "auto" && text === "[routing failure fixture]";
+  const uncertain = mode === "auto" && text === "[delivery uncertain fixture]";
+  let delivery: PlannerDelivery["delivery"] = "context";
+  if (instruction) delivery = task.status === "running" && !task.paused ? "queued" : "waiting";
+  if (uncertain) delivery = "needs_review";
+  if (failed) delivery = "routing_failed";
+  let route = instruction || uncertain ? "correction" : "context";
+  if (failed) route = "";
+  const receipt: PlannerDelivery = {
+    message_id: ++mockPlannerInstructionId,
+    route,
+    delivery,
+    text,
+    ...(failed ? { reason: "Synthetic router failure; retry routing is safe." } : {}),
+    ...(uncertain
+      ? { reason: "Synthetic interrupted delivery; existing work must be reviewed before resending." }
+      : {}),
+  };
+  mockMessageRoutes.push({ taskId, seg, requestId, fingerprint, receipt });
+  return receipt;
+}
 
 // ── related traffic evidence (finding traffic) ─────────────────────────────────────────────
 // The backend stores request/response snapshots in a separate evidence table; the frontend detail page renders them with FindingTrafficPanel.
@@ -1522,15 +1594,30 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   }
   if (seg[0] === "tasks" && seg[2] === "chat" && seg[3] === "status") return { running: false };
   if (seg[0] === "tasks" && seg[2] === "chat" && seg[3] === "stop") return { status: "stopped" };
-  if (seg[0] === "tasks" && seg[2] === "planner-instructions" && m === "POST") {
-    const text = String(b.text ?? "").trim();
-    if (!text || Array.from(text).length > 20000) throw new Error("Invalid Planner instruction");
-    const task = mockTasks.find((item) => item.id === seg[1]);
-    if (!task) throw new Error("task not found");
+  if (seg[0] === "tasks" && seg[2] === "main-message-routes" && m === "GET") {
+    const segment = Number(q.get("seg") ?? 0);
     return {
-      hint_id: ++mockPlannerInstructionId,
-      delivery: task.status === "running" && !task.paused ? "notified" : "saved",
+      items: mockMessageRoutes
+        .filter((item) => item.taskId === seg[1] && item.seg === segment)
+        .map((item) => item.receipt)
+        .sort((a, b) => b.message_id - a.message_id),
     };
+  }
+  if (seg[0] === "tasks" && seg[2] === "main-message-routes" && seg[4] === "retry" && m === "POST") {
+    const item = mockMessageRoutes.find(
+      (entry) => entry.taskId === seg[1] && entry.receipt.message_id === Number(seg[3]),
+    );
+    if (item?.receipt.delivery !== "routing_failed") throw new Error("Only failed routing can be retried");
+    item.receipt = {
+      ...item.receipt,
+      route: "context",
+      delivery: "context",
+      reason: "Synthetic routing retry completed.",
+    };
+    return item.receipt;
+  }
+  if (seg[0] === "tasks" && seg[2] === "planner-instructions" && m === "POST") {
+    return acceptMockMainMessage(seg[1], b, true);
   }
   if (path === "/active") {
     const id = String(b.id ?? mockActiveTask);
@@ -2285,9 +2372,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/settings/python/detect") return { python_interpreter: "/usr/bin/python3" };
   if (path === "/chat")
     return {
-      reply: "(demo) Your instruction was saved for Planner.",
-      mode: "hint",
-      planner_delivery: q.get("task") ? { hint_id: ++mockPlannerInstructionId, delivery: "notified" } : undefined,
+      reply: "(demo) Message saved; consult its routing receipt.",
+      mode: "rule",
+      planner_delivery: task ? acceptMockMainMessage(task, b) : undefined,
     };
   if (path === "/gc") return { removed: 0 };
 

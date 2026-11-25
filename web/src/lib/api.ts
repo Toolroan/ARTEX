@@ -9,10 +9,25 @@ import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
 
 export type PlannerDelivery = {
-  hint_id: number;
-  delivery: "notified" | "saved";
+  hint_id?: number; // historical receipt compatibility
+  message_id: number;
+  route: string;
+  delivery:
+    | "routing"
+    | "routing_failed"
+    | "context"
+    | "clarify"
+    | "queued"
+    | "waiting"
+    | "reviewing"
+    | "presented"
+    | "needs_review"
+    | "main";
   reason?: string;
+  text?: string;
 };
+export type MainRoutingMode = "auto" | "context" | "instruction";
+
 import type {
   ActiveFindingRetest,
   Activity,
@@ -23,8 +38,6 @@ import type {
   Asset,
   AssetInterceptRule,
   AssetInterceptRuleInput,
-  TaskCredential,
-  TaskCredentialInput,
   Audit,
   BatchCategoryItem,
   BatchControlItem,
@@ -49,8 +62,8 @@ import type {
   FindingDeepenResponse,
   FindingGroupsPage,
   FindingQuery,
-  FindingRetest,
   FindingReportState,
+  FindingRetest,
   FindingStats,
   FindingStatus,
   FindingsPage,
@@ -102,6 +115,8 @@ import type {
   TaskAssetScopeMutation,
   TaskCategory,
   TaskConstraint,
+  TaskCredential,
+  TaskCredentialInput,
   TaskGoal,
   TaskLLMResolutions,
   TaskNode,
@@ -411,8 +426,12 @@ export const api = {
       accepted: true;
       request_id: string;
     }>(`/tasks/${taskId}/intents/${intentId}/messages`, { message, request_id: requestId }),
-  sendPlannerInstruction: (taskId: string, text: string) =>
-    post<PlannerDelivery>(`/tasks/${taskId}/planner-instructions`, { text }),
+  sendPlannerInstruction: (taskId: string, text: string, requestId: string, seg?: number) =>
+    post<PlannerDelivery>(`/tasks/${taskId}/planner-instructions`, { text, request_id: requestId, seg }),
+  mainMessageRoutes: (taskId: string, seg: number) =>
+    get<{ items: PlannerDelivery[] }>(`/tasks/${taskId}/main-message-routes?seg=${seg}`),
+  retryMainMessageRoute: (taskId: string, messageId: number) =>
+    post<PlannerDelivery>(`/tasks/${taskId}/main-message-routes/${messageId}/retry`),
   taskLLMResolution: (id: string) => get<TaskLLMResolutions>(`/tasks/${id}/llm/resolution`),
   // Rerun an intent that did not succeed (blocked/exhausted/stopped): set back to open, and a worker re-claims and reruns it from scratch.
   rerunIntent: (taskId: string, intentId: string) =>
@@ -1064,11 +1083,20 @@ export const api = {
       `/chat/mentions?${new URLSearchParams({ kind, q: query, cursor })}`,
       { signal },
     ),
-  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number) =>
+  chat: (
+    message: string,
+    task?: string,
+    attachments?: ChatAttachment[],
+    seg?: number,
+    requestId?: string,
+    routingMode: MainRoutingMode = "auto",
+  ) =>
     post<{ reply: string; mode: string; planner_delivery?: PlannerDelivery }>(`/chat${tq(task)}`, {
       message,
       attachments,
       seg,
+      request_id: requestId,
+      routing_mode: routingMode,
     }),
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
   // Option 1, file upload: lands in the session/task working directory uploads/, returning a relative path the agent can Read.

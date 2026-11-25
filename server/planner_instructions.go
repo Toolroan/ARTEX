@@ -18,84 +18,15 @@ const (
 	maxPlannerChatBodyBytes    = maxPlannerInstructionChars*12 + 32*8192 + 4096
 )
 
-type plannerInstructionDelivery struct {
-	HintID   int64  `json:"hint_id"`
-	Delivery string `json:"delivery"` // notification is not a consumption/execution receipt
-	Reason   string `json:"reason,omitempty"`
-}
-
 func validatePlannerInstruction(text string) (string, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return "", errors.New("Planner instruction cannot be empty")
 	}
-	if !utf8.ValidString(text) || utf8.RuneCountInString(text) > maxPlannerInstructionChars {
+	if !utf8.ValidString(text) || strings.ContainsRune(text, 0) || utf8.RuneCountInString(text) > maxPlannerInstructionChars {
 		return "", fmt.Errorf("Planner instruction cannot exceed %d characters", maxPlannerInstructionChars)
 	}
 	return text, nil
-}
-
-type plannerInstructionStore interface {
-	AddNode(kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error)
-}
-
-// Persist before notifying: a failed save must never acknowledge delivery or
-// start the Main model. The callback is also used for the visible Planner echo.
-func persistPlannerInstruction(store plannerInstructionStore, text string, saved func(string)) (int64, error) {
-	text, err := validatePlannerInstruction(text)
-	if err != nil {
-		return 0, err
-	}
-	id, err := store.AddNode(db.KindHint, map[string]any{"text": text}, 0, "active", "human", nil)
-	if err != nil {
-		return 0, err
-	}
-	if saved != nil {
-		saved(text)
-	}
-	return id, nil
-}
-
-// The caller holds beginTaskOperation until this returns. Saving an instruction
-// never revives a paused/completed task or manufactures a new goal.
-func (s *Server) savePlannerInstruction(t *Task, text string) (plannerInstructionDelivery, error) {
-	id, err := persistPlannerInstruction(t.Store, text, func(saved string) {
-		s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "user", Summary: saved})
-		t.NotifyHint("human", []string{saved})
-	})
-	if err != nil {
-		return plannerInstructionDelivery{}, err
-	}
-	result := plannerInstructionDelivery{HintID: id, Delivery: "saved"}
-	state := t.lifecycleSnapshot()
-	switch {
-	case isTerminalStatus(state.Status):
-		result.Reason = "Task is completed; saved for a future eligible Planner round."
-	case state.Paused || s.engine.IsPaused(t.ID):
-		result.Reason = "Task is paused; saved until it is resumed."
-	case state.Queued:
-		result.Reason = "Task is queued; saved until the task starts."
-	case s.engine.isSettling(t.ID):
-		result.Reason = "Task is winding down; saved for a future eligible Planner round."
-	default:
-		open, err := t.Store.HasOpenGoal()
-		switch {
-		case err != nil:
-			result.Reason = "Saved, but Planner readiness could not be verified."
-		case !open:
-			result.Reason = "Task has no open goals; saved until an open goal is available."
-		case !s.engine.Started(t.ID):
-			result.Reason = "Task engine is not running; saved for its next eligible Planner round."
-		default:
-			planner, _ := s.engine.snapshotFor(t)
-			if planner == nil {
-				result.Reason = "Planner is unavailable; saved until it is available."
-			} else {
-				result.Delivery = "notified"
-			}
-		}
-	}
-	return result, nil
 }
 
 func (s *Server) plannerInstructions(w http.ResponseWriter, r *http.Request) {
@@ -105,30 +36,60 @@ func (s *Server) plannerInstructions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.engine.beginTaskOperation(t.ID) {
-		writeErr(w, http.StatusConflict, "Task is being deleted or the server is draining")
+		writeErr(w, http.StatusConflict, "Task is being deleted or server is draining")
 		return
 	}
 	defer s.engine.decInflight(t.ID)
 	var body struct {
-		Text string `json:"text"`
+		Text      string `json:"text"`
+		RequestID string `json:"request_id,omitempty"`
+		Seg       *int   `json:"seg,omitempty"`
 	}
-	// Twelve bytes covers a Unicode character encoded as a JSON surrogate pair.
 	r.Body = http.MaxBytesReader(w, r.Body, maxPlannerInstructionChars*12+1024)
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid or oversized JSON")
+	if json.NewDecoder(r.Body).Decode(&body) != nil {
+		writeErr(w, 400, "Invalid or oversized JSON")
 		return
 	}
 	text, err := validatePlannerInstruction(body.Text)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, 400, err.Error())
 		return
 	}
-	delivery, err := s.savePlannerInstruction(t, text)
+	key, err := routingRequestKey(body.RequestID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Planner instruction could not be saved; no delivery was accepted")
+		writeErr(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, delivery)
+	seg := 0
+	if body.Seg != nil {
+		seg = *body.Seg
+	} else {
+		seg, _ = t.Store.CurrentMainSeg()
+	}
+	if seg < 0 {
+		writeErr(w, 400, "Invalid Main session")
+		return
+	}
+	msg, created, err := t.Store.CreateMainMessage(r.Context(), db.MainMessageInput{Segment: seg, RequestKey: key, Mode: "instruction", InputSource: "direct_planner", RawText: body.Text, OperatorText: text})
+	if err != nil {
+		if errors.Is(err, db.ErrMainMessageConflict) {
+			writeErr(w, 409, err.Error())
+		} else {
+			writeErr(w, 500, "Instruction was not accepted because it could not be saved")
+		}
+		return
+	}
+	if created && msg.UserActivity != nil && s.engine.bc != nil {
+		s.engine.bc.Publish(t.ID, *msg.UserActivity)
+	}
+	if msg.RoutingStatus != "routed" {
+		msg, err = s.routeMainMessage(r.Context(), t, msg.ID)
+	}
+	if err != nil || msg == nil {
+		writeErr(w, 500, "Instruction is saved, but routing could not finish; check its delivery status")
+		return
+	}
+	writeJSON(w, http.StatusCreated, s.messageReceipt(t, msg))
 }
 
 // Forward only the actual operator text and references to this task's uploaded

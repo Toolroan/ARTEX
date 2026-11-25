@@ -985,10 +985,9 @@ func takePlannerTriggers(t *Task, quietCandidate bool) ([]agent.TriggerEvent, bo
 	triggers := t.drainTriggers()
 	if quietCandidate {
 		for _, trigger := range triggers {
-			// Main may add missing paths or conversation context after the
-			// original human message already started a planning round. Wake for
-			// that handoff too; its agent origin and untrusted framing stay intact.
-			if (trigger.Kind == "hint" && (trigger.HintOrigin == "human" || trigger.HintOrigin == "mainagent") && len(trigger.Hints) > 0) || trigger.Kind == "steering_unapplied" {
+			// Typed inbox availability is checked separately against the database.
+			// Untyped hints are historical context and cannot bypass quiet mode.
+			if trigger.Kind == "steering_unapplied" {
 				return triggers, false
 			}
 		}
@@ -1065,23 +1064,33 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.isSettling(t.ID) {
 			return false
 		}
+		queuedInstructions, queueErr := t.Store.HasQueuedPlannerMessages(ctx)
+		if queueErr != nil {
+			return false
+		} // never lose a pending instruction on a failed read
+		instructionOnly := false
 		// goalless (human direct-inject) branch: when the task has no open goals the
 		// planner does not run — running it would re-judge met→cancelExec and kill intents
 		// the user injected directly via the main agent. Whether to end is decided by the
 		// frontier instead: open/running intents remain → stay running and wait silently; intents all drained → land in done. The whole branch is pure Go, triggers no LLM calls, and writes no planning-round marker.
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
-			t.drainTriggers() // discard accumulated done/finding triggers to avoid unbounded growth in long goalless sessions
-			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
-				// Frontier drained and no running intents → settle. Use the Guarded variant for
-				// the CAS, to avoid stepping on concurrent pause/delete/timeout-settlement state transitions.
-				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done", ""); err != nil {
-					log.Printf("[goalless] task %s failed to settle into done: %v", t.ID, err)
-				} else if won {
-					e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
-						Summary: "All goals have been met, the direct-injected intents have finished executing, and the task is over"})
+			active, activeErr := t.Store.HasActiveIntent()
+			if queuedInstructions && activeErr == nil && active {
+				instructionOnly = true // corrections to a running one-off still reach Planner
+			} else {
+				t.drainTriggers() // discard accumulated done/finding triggers to avoid unbounded growth in long goalless sessions
+				if active, err := t.Store.HasActiveIntent(); err == nil && !active {
+					// Frontier drained and no running intents → settle. Use the Guarded variant for
+					// the CAS, to avoid stepping on concurrent pause/delete/timeout-settlement state transitions.
+					if won, err := e.m.SetTaskStatusGuarded(t.ID, "done", ""); err != nil {
+						log.Printf("[goalless] task %s failed to settle into done: %v", t.ID, err)
+					} else if won {
+						e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+							Summary: "All goals have been met, the direct-injected intents have finished executing, and the task is over"})
+					}
 				}
+				return false // an idle goalless task never starts autonomous planning
 			}
-			return false // the goalless branch never enters planner.Plan
 		}
 		// Run budget (off by default): no worker affordable any more → the forced
 		// wrap-up (once) instead of a normal round.
@@ -1098,10 +1107,14 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		// Ordinary worker edges can wait while goals are unchanged and work is
 		// active. An operator's correction must reach this round immediately.
-		triggers, quietSkipped := takePlannerTriggers(t, src == "edge" && t.PlanQuietMode && e.quietSkipEdge(t))
+		triggers, quietSkipped := takePlannerTriggers(t, !queuedInstructions && src == "edge" && t.PlanQuietMode && e.quietSkipEdge(t))
 		if quietSkipped {
 			log.Printf("[planner] task %s quiet: work in flight, goals unchanged, edge round skipped", t.ID)
 			return true
+		}
+		batch, batchErr := t.Store.ClaimPlannerMessages(ectx, 8)
+		if batchErr != nil || (queuedInstructions && batch == nil) {
+			return false
 		}
 		e.stampFirstRun(t) // first real planning round → stamp first_run_at + compute the deadline (only for tasks with a timeout)
 		e.touch(t.ID)
@@ -1114,9 +1127,44 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			Summary: fmt.Sprintf("Planning round %d", e.nextPlannerRound(t.ID))})
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		pctx := e.budgetRoundCtx(e.plannerGateContext(ectx, t, intercept.DefaultTargetWaitBound), t, false)
+		pctx = plannerInboxContext(pctx, t, batch)
+		if batch != nil {
+			pctx = agent.WithPlannerDeliveryFence(pctx, func(checkCtx context.Context) error {
+				check, stop := context.WithTimeout(checkCtx, 5*time.Second)
+				defer stop()
+				return t.Store.CheckMainDelivery(check, batch.Token)
+			})
+		}
+		if instructionOnly {
+			pctx = agent.WithPlannerInstructionOnly(pctx)
+		}
+		token := ""
+		if batch != nil {
+			token = batch.Token
+		}
+		pctx, stopDeliveryHeartbeat := startMainDeliveryHeartbeat(pctx, t, token)
 		e.BeginLLMCall(t.ID)
 		met, reason, err := planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, t.TargetGuard.Hooks(), emit)
 		e.EndLLMCall(t.ID)
+		deliveryHealthy := pctx.Err() == nil
+		stopDeliveryHeartbeat()
+		if batch != nil {
+			persist, stop := context.WithTimeout(context.WithoutCancel(ectx), 5*time.Second)
+			finishErr := t.Store.FinishPlannerMessages(persist, batch.Token, err == nil && deliveryHealthy)
+			stop()
+			if finishErr != nil {
+				e.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", IsError: true, Summary: "Instruction review receipt could not be saved. Check existing effects before retrying."})
+			}
+		}
+		queueCheck, stopQueueCheck := context.WithTimeout(context.WithoutCancel(ectx), 5*time.Second)
+		pending, readErr := t.Store.HasQueuedPlannerMessages(queueCheck)
+		stopQueueCheck()
+		if readErr == nil && pending {
+			t.Notify()
+		}
+		if !deliveryHealthy {
+			return false
+		}
 		switch {
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s planning error: %v", t.ID, err)

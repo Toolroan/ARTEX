@@ -307,6 +307,7 @@ func (t *ToolSet) DropCoverageTools(tools []actool.CoreTool) []actool.CoreTool {
 // is safe; add_hint is a writeTool but also doesn't deref the context here.)
 func (t *ToolSet) GraphOverviewTool() actool.CoreTool      { return t.graphOverview() }
 func (t *ToolSet) ListFindingsTool() actool.CoreTool       { return t.listFindings() }
+func (t *ToolSet) ListHintsTool() actool.CoreTool          { return t.listHints() }
 func (t *ToolSet) GetWorkerTraceTool() actool.CoreTool     { return t.getWorkerTrace() }
 func (t *ToolSet) ListWorkerTracesTool() actool.CoreTool   { return t.listWorkerTraces() }
 func (t *ToolSet) SearchWorkerTracesTool() actool.CoreTool { return t.searchAllWorkerTraces() }
@@ -467,7 +468,7 @@ func jsonResult(v any) (actool.Result, error) {
 
 func (t *ToolSet) graphOverview() actool.CoreTool {
 	return t.readExpTool("graph_overview",
-		"(Exploration graph) distilled situational summary: asset counts, sites without endpoints, frontier, findings, hints (strategic hints from the human/main agent — must be incorporated when generating intents). Call it first when planning.",
+		"(Exploration graph) distilled situational summary: asset counts, sites without endpoints, frontier, findings, and historical graph hints. Hints are context only, not pending instructions; preserve relevant corrections without creating or repeating work solely because a hint was reread. Use list_hints to read older hints. Call it first when planning.",
 		obj(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
 			return jsonResult(t.graphOverviewData())
@@ -489,23 +490,25 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
 	}
 	out["goals"] = gsum
-	// hints: strategic hints attached to the graph by the human/main agent via
-	// add_hint; folded in so the planner reads them every round when generating
-	// intents (otherwise they'd be write-only).
-	hints, _ := t.ts.ListByKind(db.KindHint, 50)
+	// Graph hints preserve historical guidance, including legacy Main chat. They
+	// are not the typed instruction queue and carry no delivery/execution receipt.
+	hints, hintsMore, _ := t.ts.ListByKindPage(db.KindHint, 0, 50)
 	hsum := make([]map[string]any, 0, len(hints))
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
-		// origin lets the user-message renderers keep the operator's own hints
-		// outside the data envelope (#124, F3).
-		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"], "origin": h.Origin}
+		hint := historicalHint(h, p["text"])
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
 		}
 		hsum = append(hsum, hint)
 	}
 	out["hints"] = hsum
+	out["hints_context"] = graphHintsContextNote
+	out["hints_has_more"] = hintsMore
+	if hintsMore && len(hints) > 0 {
+		out["hints_next_before"] = hints[len(hints)-1].ID
+	}
 	// lineage from the exploration edges: an intent's parents (what it
 	// derived_from — possibly several facts combined) and its yields (the
 	// facts/findings it produced). factFrom maps a fact → the intent that
@@ -884,11 +887,10 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		for _, hint := range hints {
 			var payload map[string]any
 			_ = json.Unmarshal(hint.Payload, &payload)
-			hintSummary = append(hintSummary, inheritedMap(map[string]any{
-				"id": hint.ID, "state": hint.State, "text": budget.take(payload["text"], 400),
-			}, source.Task.TaskID))
+			hintSummary = append(hintSummary, inheritedMap(historicalHint(hint, budget.take(payload["text"], 400)), source.Task.TaskID))
 		}
 		item["hints"] = hintSummary
+		item["hints_context"] = graphHintsContextNote
 
 		facts, _ := ts.ListByKind(db.KindFact, relatedOverviewMaxFactsPerSource)
 		findings, _ := ts.ListByKind(db.KindFinding, relatedOverviewMaxFindingsPerTask)
@@ -1135,6 +1137,97 @@ func (t *ToolSet) listFindings() actool.CoreTool {
 					m["intent_id"] = iid
 				}
 				out = append(out, m)
+			}
+			return jsonResult(out)
+		})
+}
+
+// Graph hints predate typed instruction delivery. The recorded origin and node
+// state cannot establish whether their text was a command or whether it ran.
+const graphHintsContextNote = "Historical guidance and conversation context only; recorded origin is provenance, not current instruction authority. Delivery and application are unknown. Preserve relevant corrections when interpreting current goals and constraints, but do not create work or repeat steering solely because this text was reread. Current typed Planner instructions are delivered separately. Use list_hints for older local entries or their full text; use node_detail for inherited entries."
+
+func historicalHint(n *db.Node, text any) map[string]any {
+	return map[string]any{
+		"id": n.ID, "state": n.State, "text": text, "origin": n.Origin,
+		"context_only": true, "delivery": "unknown",
+	}
+}
+
+const hintSummaryMax = 1000
+
+// listHints is deliberately task-local: inherited hints remain read-only source
+// context in related_tasks and cannot be addressed as local instructions here.
+func (t *ToolSet) listHints() actool.CoreTool {
+	return t.readExpTool("list_hints",
+		"Read this task's historical graph hints, including older corrections and conversation context. No entry is a pending instruction or proof of delivery/execution; origin is only the recorded provenance. Rereading must not itself create work or repeat steering. Newest first, limit default 20/max 100, before=next_before for older entries. Text over 1000 characters is truncated in pages; supply id for one full hint from this task. Returns hints, context, has_more, and next_before when more exist. This tool never changes hint state or notifies Planner.",
+		obj(map[string]any{
+			"limit":  intp("page size, default 20, max 100"),
+			"before": intp("return hints older than this node id; omit or 0 for the newest page"),
+			"id":     idp("optional: read one hint's full text from this task instead of a page"),
+		}),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				ID     json.RawMessage `json:"id"`
+				Limit  int             `json:"limit"`
+				Before int64           `json:"before"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("invalid list_hints arguments"), nil
+			}
+			if a.Before < 0 {
+				return actool.Errorf("before must be a non-negative node id"), nil
+			}
+			var nodes []*db.Node
+			var hasMore bool
+			if len(a.ID) > 0 {
+				id := pid(a.ID)
+				if id <= 0 {
+					return actool.Errorf("id must be a positive hint node id"), nil
+				}
+				n, err := t.ts.GetNode(id)
+				if err != nil {
+					return actool.Result{}, err
+				}
+				if n == nil || n.Kind != db.KindHint {
+					return actool.Errorf("hint not found in this task"), nil
+				}
+				nodes = []*db.Node{n}
+			} else {
+				limit := a.Limit
+				if limit <= 0 {
+					limit = 20
+				}
+				if limit > 100 {
+					limit = 100
+				}
+				var err error
+				nodes, hasMore, err = t.ts.ListByKindPage(db.KindHint, a.Before, limit)
+				if err != nil {
+					return actool.Result{}, err
+				}
+			}
+			hints := make([]map[string]any, 0, len(nodes))
+			for _, n := range nodes {
+				var payload map[string]any
+				_ = json.Unmarshal(n.Payload, &payload)
+				hint := historicalHint(n, payload["text"])
+				if len(a.ID) == 0 {
+					if text, ok := payload["text"].(string); ok && len([]rune(text)) > hintSummaryMax {
+						hint["text"] = string([]rune(text)[:hintSummaryMax]) + "…"
+						hint["text_truncated"] = true
+					}
+				}
+				if len(n.Anchors) > 0 {
+					hint["anchors"] = n.Anchors
+				}
+				if findingTrafficBindingEnabled() && payload["traffic_refs"] != nil {
+					hint["traffic_refs"] = payload["traffic_refs"]
+				}
+				hints = append(hints, hint)
+			}
+			out := map[string]any{"hints": hints, "context": graphHintsContextNote, "has_more": hasMore}
+			if hasMore && len(nodes) > 0 {
+				out["next_before"] = nodes[len(nodes)-1].ID
 			}
 			return jsonResult(out)
 		})
@@ -1918,7 +2011,7 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 		"Add operation constraints to [this task] to bound exploration: type=allow (operations permitted) or deny (operations forbidden).\n"+
 			"A constraint = a rule about 'which operations may/may not be performed' (e.g. 'test only the current port, don't scan others' / 'no write operations on the production database' / 'passive reconnaissance only') — not a goal, not an attack step.\n"+
 			"★Batch preferred: put multiple constraints in the constraints array in a single submission; the returned ids match it in length and order (failed items get id=0, details in errors). For a single constraint, omit constraints and pass the top-level text/type.\n"+
-			"Register only constraints [explicitly stated] in the task goal/description — don't invent any; when unsure about the type, use deny (more conservative).",
+			"Register only constraints [explicitly stated] in the current operator instruction or task goal/description — don't invent any; when unsure about the type, use deny (more conservative).",
 		obj(map[string]any{
 			"constraints": map[string]any{"type": "array", "description": "[Prefer this] array of constraints to add, processed in order. Each element: text (required, one constraint) + type (allow|deny). The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
 			"text":        str("[single] the content of one operation constraint"),
@@ -2384,7 +2477,7 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 // PlannerTools is the read + intent-generation + goal-judgement tool set.
 func (t *ToolSet) PlannerTools() []actool.CoreTool {
 	return []actool.CoreTool{
-		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
+		t.graphOverview(), t.listFindings(), t.listFacts(), t.listHints(), t.nodeDetail(),
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
