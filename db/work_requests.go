@@ -304,9 +304,24 @@ func (s *ExplorationStore) LinkWorkRequestNode(ctx context.Context, g WorkReques
 		return errors.New("only goals, intents, facts and findings may be linked to a request")
 	}
 	key := fmt.Sprintf("node:%d", nodeID)
-	_, err = tx.ExecContext(ctx, `INSERT INTO work_request_nodes(request_id,request_revision,kind,slot_key,summary,allocation_key,node_id) VALUES($1,$2,$3,$4,$5,$5,$6) ON CONFLICT(request_id,node_id) DO NOTHING`, g.RequestID, g.Revision, kind, uuid.NewString(), key, nodeID)
+	var fields map[string]any
+	_ = json.Unmarshal(payload, &fields)
+	field := "summary"
+	if kind == "goal" {
+		field = "text"
+	}
+	summary, _ := fields[field].(string)
+	if summary = strings.TrimSpace(summary); summary == "" {
+		summary = key
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO work_request_nodes(request_id,request_revision,kind,slot_key,summary,allocation_key,node_id) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(request_id,node_id) DO NOTHING`, g.RequestID, g.Revision, kind, uuid.NewString(), summary, key, nodeID)
 	if err != nil {
 		return err
+	}
+	if kind == "goal" || kind == "intent" {
+		if _, err = tx.ExecContext(ctx, `UPDATE work_requests SET state='active',resolution='',updated_at=now() WHERE id=$1`, g.RequestID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

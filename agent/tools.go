@@ -1570,7 +1570,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 				if allMet {
 					t.GoalMet = true
 					t.Reason = fmt.Sprintf("all %d goals are met (last triggered by goal %d)", len(goals), goal)
-					return actool.Text(fmt.Sprintf("goal %d marked met; all goals of this task are met — the task is automatically judged complete", goal)), nil
+					return actool.Text(fmt.Sprintf("goal %d marked met; all goals of this task are met; verify and resolve durable work requests before the server can complete the task", goal)), nil
 				}
 			}
 			return actool.Text(fmt.Sprintf("goal %d marked met", goal)), nil
@@ -1578,7 +1578,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 }
 
 func (t *ToolSet) goalMet() actool.CoreTool {
-	return t.writeExpTool("goal_met", "[End the entire task immediately] — call only when you are sure [all of the task's goals are truly met and it is complete overall] (note: the task as a [whole]; having met just one goal / one flag / one finding [does not count] — in that case mark that goal with prove_goal). ⚠️ It is NOT for \"ending this planning round\": if there is no new intent to dispatch this round, or you're waiting on worker output, [just end the round — do NOT call this tool] (0 intents is a perfectly normal outcome). Prefer prove_goal to prove goals one by one; goal_met is only a means to skip per-goal proofs and complete the task globally.",
+	return t.writeExpTool("goal_met", "[Propose successful task completion] — the server also requires no unresolved durable requests or active work. Call only when you are sure [all of the task's goals are truly met and it is complete overall] (note: the task as a [whole]; having met just one goal / one flag / one finding [does not count] — in that case mark that goal with prove_goal). ⚠️ It is NOT for \"ending this planning round\": if there is no new intent to dispatch this round, or you're waiting on worker output, [just end the round — do NOT call this tool] (0 intents is a perfectly normal outcome). Prefer prove_goal to prove goals one by one; goal_met is only a means to skip per-goal proofs and complete the task globally.",
 		obj(map[string]any{"reason": str("grounds for completion (must be evidence that the goals are truly met, not a round-ending reason like 'no new directions this round')")}, "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
@@ -1596,7 +1596,7 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 				}
 			}
 			if open > 0 {
-				return actool.Errorf(fmt.Sprintf("goal_met refused: %d of %d goals of this task are still open; the task stays open. Prove each one with prove_goal(goal_id, evidence_id, reason): the task completes automatically when its last goal is marked met.", open, len(goals))), nil
+				return actool.Errorf(fmt.Sprintf("goal_met refused: %d of %d goals of this task are still open; the task stays open. Prove each one with prove_goal(goal_id, evidence_id, reason): resolve any durable requests after verifying their acceptance criteria; the server admits task completion only when no work remains.", open, len(goals))), nil
 			}
 			t.GoalMet = true
 			t.Reason = a.Reason
@@ -2162,8 +2162,8 @@ func (t *ToolSet) addHint() actool.CoreTool {
 // killWorkTool lets the planner terminate a single running work (by intent id).
 func (t *ToolSet) killWorkTool() actool.CoreTool {
 	return t.writeExpTool("kill_work", "Terminate a running intent (work). Used to stop off-track/meaningless exploration; the terminated intent is marked stopped and won't be re-claimed automatically. Check what it's doing with get_worker_output before deciding.",
-		obj(map[string]any{"intent_id": idp("the id of the intent to terminate (= the work handle)")}, "intent_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		obj(map[string]any{"request_id": idp("current durable request ID; required when multiple requests are granted"), "intent_id": idp("the id of the intent to terminate (= the work handle)")}, "intent_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.killWork == nil {
 				return actool.Errorf("kill_work is currently unavailable"), nil
 			}
@@ -2178,6 +2178,9 @@ func (t *ToolSet) killWorkTool() actool.CoreTool {
 			node, err := t.ts.GetNode(id)
 			if err != nil || node == nil || node.Kind != db.KindIntent {
 				return actool.Errorf("intent_id must be an intent of this task (related-task intents are read-only)"), nil
+			}
+			if err := t.linkControlledWorkRequest(ctx, in, id); err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			if err := t.killWork(id); err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -2194,10 +2197,11 @@ func (t *ToolSet) killWorkTool() actool.CoreTool {
 func (t *ToolSet) steerWorkTool() actool.CoreTool {
 	return t.writeExpTool("steer_work", "Queue a course-correction instruction for a running intent (work) at its next safe model/tool boundary, preserving its context. A tool already running can finish. Success means queued, not applied: stopping or budget limits can leave the correction unapplied, so inspect subsequent worker output. For in-intent corrections like 'stop doing X, focus on Y'; if the whole direction is wrong, use kill_work and dispatch a new intent instead. Check what it is doing with get_worker_output first.",
 		obj(map[string]any{
-			"intent_id": idp("the id of the intent to steer (= the work handle)"),
-			"message":   str("the course-correction instruction for the worker — state clearly what to stop and what to turn to"),
+			"request_id": idp("current durable request ID; required when multiple requests are granted"),
+			"intent_id":  idp("the id of the intent to steer (= the work handle)"),
+			"message":    str("the course-correction instruction for the worker — state clearly what to stop and what to turn to"),
 		}, "intent_id", "message"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.steerWork == nil {
 				return actool.Errorf("steer_work is currently unavailable"), nil
 			}
@@ -2216,6 +2220,9 @@ func (t *ToolSet) steerWorkTool() actool.CoreTool {
 			}
 			if strings.TrimSpace(a.Message) == "" {
 				return actool.Errorf("message is required"), nil
+			}
+			if err := t.linkControlledWorkRequest(ctx, in, id); err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			if err := t.steerWork(id, a.Message); err != nil {
 				return actool.Errorf(err.Error()), nil

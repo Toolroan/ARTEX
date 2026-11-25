@@ -133,7 +133,7 @@ func enforceWorkRequestTools(ctx context.Context, tools, canonical []actool.Core
 	out := make([]actool.CoreTool, 0, len(tools))
 	for _, tool := range tools {
 		name := tool.Name()
-		if name != "set_goals" && name != "add_intent" && !workRequestAuxTool(name) && name != "list_work_requests" {
+		if name != "set_goals" && name != "add_intent" && !workRequestAuxTool(name) && name != "list_work_requests" && name != "steer_work" && name != "kill_work" {
 			out = append(out, tool)
 			continue
 		}
@@ -266,4 +266,17 @@ func (t *ToolSet) addRequestGoal(ctx context.Context, grant db.WorkRequestGrant,
 		return 0, false, err
 	}
 	return t.ts.CreateWorkRequestNode(ctx, grant, db.WorkNodeSpec{ItemID: item.ID, Payload: payload, Origin: t.worker})
+}
+
+// Record the affected existing intent before sending a control signal. Worker
+// termination will then request outcome review of the SAME correction request.
+func (t *ToolSet) linkControlledWorkRequest(ctx context.Context, raw json.RawMessage, intentID int64) error {
+	grant, err := selectWorkRequest(ctx, raw)
+	if err != nil {
+		return err
+	}
+	if grant == nil {
+		return nil
+	}
+	return t.ts.LinkWorkRequestNode(ctx, *grant, intentID)
 }

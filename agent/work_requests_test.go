@@ -226,3 +226,64 @@ func TestWorkRequestContextAndToolPolicyStayScoped(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkRequestWorkerControlsLinkExistingIntentBeforeEffect(t *testing.T) {
+	for _, name := range []string{"steer_work", "kill_work"} {
+		t.Run(name, func(t *testing.T) {
+			store := guardTaskStore(t)
+			grant, request := agentWorkRequestFixture(t, store, "control-"+name)
+			iid, err := store.AddIntent(map[string]any{"summary": "Existing synthetic worker"}, 1, nil, "planner")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SetIntentState(iid, "running"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.HandoffMainRequest(t.Context(), grant.RequestID, grant.DeliveryToken); err != nil {
+				t.Fatal(err)
+			}
+			batch, err := store.ClaimPlannerMessages(t.Context(), 8)
+			if err != nil || batch == nil {
+				t.Fatalf("claim: %v", err)
+			}
+			grant.Owner, grant.DeliveryToken = "planner", batch.Token
+			ctx := WithWorkRequests(t.Context(), []db.WorkRequestGrant{grant}, []db.WorkRequest{request})
+			ts := NewToolSet(store, "planner")
+			calls := 0
+			check := func(id int64) error {
+				calls++
+				w, err := store.GetWorkRequest(t.Context(), request.ID)
+				if err != nil || len(w.Nodes) != 1 || w.Nodes[0].NodeID != id || w.State != "active" {
+					t.Fatalf("control ran before durable link: %+v %v", w, err)
+				}
+				return nil
+			}
+			ts.killWork = check
+			ts.steerWork = func(id int64, _ string) error { return check(id) }
+			tool := ts.steerWorkTool()
+			if name == "kill_work" {
+				tool = ts.killWorkTool()
+			}
+			input := map[string]any{"intent_id": iid, "message": "Use the corrected synthetic input"}
+			if result := callWorkTool(t, ctx, tool, input); result.IsError {
+				t.Fatalf("control failed: %+v", result)
+			}
+			if err := store.FinishPlannerMessages(t.Context(), batch.Token, true); err != nil {
+				t.Fatal(err)
+			}
+			if result := callWorkTool(t, ctx, tool, input); !result.IsError || calls != 1 {
+				t.Fatal("stale request sent another worker control")
+			}
+			if err := store.SetIntentState(iid, "done"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.MarkIntentRequestsForReview(t.Context(), iid); err != nil {
+				t.Fatal(err)
+			}
+			w, err := store.GetWorkRequest(t.Context(), request.ID)
+			if err != nil || w.State != "review" {
+				t.Fatalf("corrected worker outcome lost: %+v %v", w, err)
+			}
+		})
+	}
+}
