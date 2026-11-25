@@ -6,7 +6,6 @@
 import { t } from "@/i18n";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
-import { mockHandle } from "@/lib/mock/handler";
 
 export type PlannerDelivery = {
   hint_id?: number; // historical receipt compatibility
@@ -19,14 +18,28 @@ export type PlannerDelivery = {
     | "clarify"
     | "queued"
     | "waiting"
+    | "blocked"
     | "reviewing"
     | "presented"
     | "needs_review"
     | "main";
   reason?: string;
   text?: string;
+  task_status?: TaskStatus;
+  required_action?: "restart" | "resume";
 };
 export type MainRoutingMode = "auto" | "context" | "instruction";
+export type TaskControlAction = "pause" | "resume" | "restart" | "wake";
+export type TaskControlResult = {
+  id: string;
+  paused: boolean;
+  queued: boolean;
+  status: TaskStatus;
+  action?: TaskControlAction;
+  wake_sent?: boolean;
+  already_active?: boolean;
+  blocked_reason?: string;
+};
 
 import type {
   ActiveFindingRetest,
@@ -118,6 +131,7 @@ import type {
   TaskAssetMutation,
   TaskAssetScopeMutation,
   TaskCategory,
+  TaskStatus,
   TaskConstraint,
   TaskCredential,
   TaskCredentialInput,
@@ -166,7 +180,12 @@ export class ApiError extends Error {
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
+  // Keep fixture initialization out of production bundles. This direct build-time
+  // condition lets Next omit the mock module entirely when mock mode is off.
+  if (process.env.NEXT_PUBLIC_MOCK === "1") {
+    const { mockHandle } = await import("@/lib/mock/handler");
+    return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
+  }
   const token = getToken();
   const r = await fetch(`/api${path}`, {
     ...init,
@@ -385,8 +404,7 @@ export const api = {
       llm_rotate: llmRotate,
     }),
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
-  controlTask: (id: string, action: "pause" | "resume") =>
-    post<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/control`, { action }),
+  controlTask: (id: string, action: TaskControlAction) => post<TaskControlResult>(`/tasks/${id}/control`, { action }),
   controlTasksBatch: (taskIds: string[], action: "pause" | "resume") =>
     post<{ items: BatchControlItem[] }>("/tasks/control/batch", { task_ids: taskIds, action }),
   taskArchives: (input?: { page?: number; size?: number; q?: string; state?: string }) => {

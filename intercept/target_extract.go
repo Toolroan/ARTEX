@@ -25,7 +25,7 @@ var noTargetTools = toolSet(
 	"graph_overview", "list_findings", "list_facts", "list_hints", "get_main_conversation", "get_instruction_status", "node_detail", "expand_digest",
 	"get_worker_output", "get_worker_trace", "search_all_worker_traces",
 	"add_hint", "add_intent", "steer_work", "kill_work",
-	"set_goals", "set_constraints", "list_goals", "prove_goal", "goal_met",
+	"set_goals", "set_constraints", "list_goals", "prove_goal", "goal_met", "wake_planner", "continue_task",
 	"insert_assets", "add_company_scope", "add_task_scope", "list_assets",
 	"list_untested_assets", "list_companies", "report_finding", "record_fact",
 	"save_task_credential", "list_task_credentials", "ingest_bbot", "ingest_scan_output", "record_coverage",

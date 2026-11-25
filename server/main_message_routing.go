@@ -23,11 +23,13 @@ import (
 // Conversation storage and instruction delivery are deliberately separate. A
 // persisted chat message is not, by itself, permission for Planner to act.
 type mainMessageReceipt struct {
-	MessageID int64  `json:"message_id"`
-	Route     string `json:"route"`
-	Delivery  string `json:"delivery"`
-	Reason    string `json:"reason,omitempty"`
-	Text      string `json:"text,omitempty"`
+	MessageID      int64  `json:"message_id"`
+	Route          string `json:"route"`
+	Delivery       string `json:"delivery"`
+	Reason         string `json:"reason,omitempty"`
+	Text           string `json:"text,omitempty"`
+	TaskStatus     string `json:"task_status,omitempty"`
+	RequiredAction string `json:"required_action,omitempty"`
 }
 
 func (s *Server) acceptMainMessage(w http.ResponseWriter, r *http.Request) {
@@ -173,11 +175,11 @@ func (s *Server) plannerWaitingReason(t *Task) string {
 	state := t.lifecycleSnapshot()
 	switch {
 	case isTerminalStatus(state.Status):
-		return "Task is completed; waiting for an eligible Planner round."
-	case state.Paused || s.engine.IsPaused(t.ID):
-		return "Task is paused; waiting until it is resumed."
+		return terminalInstructionReason(state.Status)
 	case state.Queued:
 		return "Task is queued; waiting until it starts."
+	case state.Paused || s.engine.IsPaused(t.ID):
+		return "Task is paused; waiting until it is resumed."
 	case s.engine.isSettling(t.ID):
 		return "Task is winding down; instruction remains saved."
 	}
@@ -187,8 +189,12 @@ func (s *Server) plannerWaitingReason(t *Task) string {
 	}
 	if !open {
 		active, activeErr := t.Store.HasActiveIntent()
-		if activeErr != nil || !active {
-			return "Task has no open goals; waiting for an eligible Planner round."
+		pending, pendingErr := t.Store.HasQueuedPlannerMessages(s.ctx)
+		if activeErr != nil || pendingErr != nil {
+			return "Planner readiness could not be checked; instruction remains saved."
+		}
+		if !active && !pending {
+			return "Task has no open work or pending Planner instructions."
 		}
 	}
 	if !s.engine.Started(t.ID) {
@@ -220,7 +226,7 @@ func (s *Server) messageReceipt(t *Task, msg *db.MainMessage) mainMessageReceipt
 		r.Delivery, r.Reason = "presented", "Reviewed; this is not confirmation that a worker applied it."
 	case msg.DeliveryOwner == "main":
 		r.Delivery, r.Reason = "main", "Main is handling the requested task configuration or bounded one-off."
-		if reason := s.mainWaitingReason(t); reason != "" {
+		if reason := s.mainMessageWaitingReason(t, msg); reason != "" {
 			r.Delivery, r.Reason = "waiting", reason
 		}
 	case msg.DeliveryStatus == "inflight":
@@ -230,6 +236,8 @@ func (s *Server) messageReceipt(t *Task, msg *db.MainMessage) mainMessageReceipt
 		if reason := s.plannerWaitingReason(t); reason != "" {
 			r.Delivery, r.Reason = "waiting", reason
 		}
+		state := t.lifecycleSnapshot()
+		applyInstructionBlocker(&r, state.Status, state.Paused)
 	}
 	return r
 }
@@ -360,7 +368,7 @@ func (s *Server) routeMainMessage(ctx context.Context, t *Task, id int64) (*db.M
 				err = errors.New("Message router is unavailable")
 			} else {
 				route, err = agent.RouteMainMessage(rctx, runtime, agent.MainMessageRouteInput{
-					MessageID: msg.ID, Text: msg.OperatorText, Context: mainStoredContext(msg), Lifecycle: t.lifecycleSnapshot().Status,
+					MessageID: msg.ID, Text: msg.OperatorText, Context: mainStoredContext(msg), Lifecycle: s.mainRoutingLifecycle(t),
 				})
 			}
 			s.engine.EndLLMCall(t.ID)
@@ -466,6 +474,7 @@ func (s *Server) mainMutationPolicy(t *Task, msg *db.MainMessage) agent.MainTurn
 	}
 	var mutationMu sync.Mutex
 	var oneoffCalled bool
+	var lifecycleCalled bool
 	policy.Execute = func(ctx context.Context, tool string, input json.RawMessage, run func() (actool.Result, error)) (actool.Result, error) {
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
@@ -477,6 +486,15 @@ func (s *Server) mainMutationPolicy(t *Task, msg *db.MainMessage) agent.MainTurn
 		}
 		if current == nil || current.DeliveryOwner != "main" || current.DeliveryStatus != "inflight" || current.DeliveryToken != msg.DeliveryToken || current.DeliveryUntil == nil || !current.DeliveryUntil.After(time.Now()) {
 			return actool.Errorf("This message no longer owns a Main action"), nil
+		}
+		if tool == "wake_planner" || tool == "continue_task" {
+			if mainLifecycleTool(current) != tool || lifecycleCalled {
+				return actool.Errorf("This message does not authorize another task-control operation. Check its current status."), nil
+			}
+			lifecycleCalled = true
+			// The canonical callback uses the locked scheduler helper. It checks
+			// the specific wake/restart lifecycle instead of the ordinary-write gate.
+			return run()
 		}
 		state := t.lifecycleSnapshot()
 		if state.Paused || state.Queued || s.engine.IsPaused(t.ID) || s.engine.IsDeleting(t.ID) || s.engine.isSettling(t.ID) {
@@ -528,7 +546,7 @@ func (s *Server) runMainMessage(ctx context.Context, t *Task, msg *db.MainMessag
 		s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", Summary: s.messageReceipt(t, msg).Reason, MainSeg: &seg})
 		return
 	}
-	if msg.DeliveryOwner == "main" && msg.DeliveryStatus == "queued" && s.mainWaitingReason(t) == "" {
+	if msg.DeliveryOwner == "main" && msg.DeliveryStatus == "queued" && s.mainMessageWaitingReason(t, msg) == "" {
 		claimed, err := t.Store.ClaimMainDelivery(ctx, msg.ID)
 		if err != nil || claimed == nil {
 			return
@@ -562,6 +580,18 @@ func (s *Server) runMainMessage(ctx context.Context, t *Task, msg *db.MainMessag
 	gctx = agent.WithMainTurnPolicy(gctx, s.mainMutationPolicy(t, msg))
 	gctx = agent.WithMainConversationReader(gctx, conversationReader(t, seg))
 	gctx = agent.WithInstructionStatusReader(gctx, s.instructionStatusReader(t, seg, msg.ID))
+	gctx = agent.WithMainLifecycleControl(gctx, func(callCtx context.Context, action string) (json.RawMessage, error) {
+		if err := callCtx.Err(); err != nil {
+			return nil, err
+		}
+		// mainMutationPolicy holds concMu and has checked this durable message's
+		// ownership, exact permitted tool and live delivery lease.
+		result, err := s.applyTaskLifecycleControlLocked(t, action)
+		if err != nil && result.BlockedReason == "" {
+			return nil, err
+		}
+		return json.Marshal(result)
+	})
 	gctx, stopHeartbeat := startMainDeliveryHeartbeat(gctx, t, msg.DeliveryToken)
 	s.engine.BeginLLMCall(t.ID)
 	reply, err := s.agentsForTask(t).main.Chat(gctx, routingTaskID(t.ID), seg, s.m.Assets(), t.Store, t.Goal, agentMsg, t.TargetGuard.Hooks(), emit, t.Notify, func() {
@@ -615,8 +645,11 @@ func (s *Server) runMainRoutingRecovery() {
 			if pending, readErr := t.Store.HasQueuedPlannerMessages(s.ctx); readErr == nil && pending && s.plannerWaitingReason(t) == "" {
 				t.Notify()
 			}
-			if err == nil && len(ids) == 0 && s.mainWaitingReason(t) == "" {
-				ids, err = t.Store.ReadyMainDeliveryIDs(s.ctx, 1)
+			if err == nil && len(ids) == 0 {
+				ids, err = t.Store.ReadyMainLifecycleDeliveryIDs(s.ctx, 1)
+				if err == nil && len(ids) == 0 && s.mainWaitingReason(t) == "" {
+					ids, err = t.Store.ReadyMainDeliveryIDs(s.ctx, 1)
+				}
 			}
 			s.engine.decInflight(t.ID)
 			if err != nil || len(ids) == 0 {

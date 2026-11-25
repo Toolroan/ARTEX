@@ -2780,5 +2780,21 @@
   "Saved by": "保存者",
   "Intent #{id}": "意图 #{id}",
   "Original file": "原始文件",
-  "Preview contents": "预览内容"
+  "Preview contents": "预览内容",
+  "Task timed out or reached its run limit. Planner is stopped; saved instructions cannot run until you continue the task.": "任务已超时或达到运行上限。Planner 已停止；继续任务后才能执行已保存的指令。",
+  "Task completed. Planner is stopped; saved instructions cannot run until you continue the task.": "任务已完成。Planner 已停止；继续任务后才能执行已保存的指令。",
+  "Task failed. Planner is stopped; saved instructions cannot run until you continue the task.": "任务已失败。Planner 已停止；继续任务后才能执行已保存的指令。",
+  "Task timed out or reached its run limit — instruction blocked": "任务已超时或达到运行上限 — 指令被阻止",
+  "Task completed — instruction blocked": "任务已完成 — 指令被阻止",
+  "Task failed — instruction blocked": "任务已失败 — 指令被阻止",
+  "Instruction blocked — task action required": "指令被阻止 — 需要操作任务",
+  "Continue task": "继续任务",
+  "Wake Planner": "唤醒 Planner",
+  "Save for Planner": "保存给 Planner",
+  "Continue this task through the run queue so Planner can review saved instructions. Existing messages are kept.": "通过运行队列继续此任务，让 Planner 审阅已保存的指令。现有消息会保留。",
+  "Task queued. Planner will review saved instructions after admission.": "任务已进入队列。获准运行后，Planner 将审阅已保存的指令。",
+  "Planner wake requested. Instruction delivery remains tracked separately.": "已请求唤醒 Planner。指令投递状态仍会单独跟踪。",
+  "Task continued. Saved instructions are awaiting Planner review.": "任务已继续。已保存的指令正在等待 Planner 审阅。",
+  "Instructions are waiting for Planner. A wake requests a review; it does not confirm that work was applied.": "指令正在等待 Planner。唤醒操作会请求审阅，并不表示工作已经执行。",
+  "Last task control response:": "上次任务控制响应："
 }

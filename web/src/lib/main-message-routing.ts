@@ -49,6 +49,11 @@ export function routingDeliveryLabel(receipt: PlannerDelivery): string {
       return "Queued for Planner — not applied";
     case "waiting":
       return "Waiting for Planner — not applied";
+    case "blocked":
+      if (receipt.task_status === "timeout") return "Task timed out or reached its run limit — instruction blocked";
+      if (receipt.task_status === "done") return "Task completed — instruction blocked";
+      if (receipt.task_status === "failed") return "Task failed — instruction blocked";
+      return "Instruction blocked — task action required";
     case "reviewing":
       return "Planner reviewing — not applied";
     case "presented":

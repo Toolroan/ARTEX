@@ -26,14 +26,18 @@ func (s *Server) instructionStatusReader(t *Task, segment int, currentID int64) 
 		if err != nil {
 			return agent.InstructionStatusPage{}, err
 		}
+		pending, err := t.Store.HasQueuedPlannerMessages(readCtx)
+		if err != nil {
+			return agent.InstructionStatusPage{}, err
+		}
 		if err := readCtx.Err(); err != nil {
 			return agent.InstructionStatusPage{}, err
 		}
 		state := t.lifecycleSnapshot()
-		paused := state.Paused || s.engine.IsPaused(t.ID)
+		paused := state.Paused || (!state.Queued && s.engine.IsPaused(t.ID))
 		started := s.engine.Started(t.ID)
 		settling := s.engine.isSettling(t.ID) || s.engine.IsDeleting(t.ID)
-		plannerWait, mainWait := instructionStatusWaitingReasons(state, paused, started, settling, openGoal, activeIntent)
+		plannerWait, mainWait := instructionStatusWaitingReasons(state, paused, started, settling, openGoal, activeIntent, pending)
 		page := agent.InstructionStatusPage{
 			ObservedAt: time.Now().UTC(), CurrentMessageID: currentID,
 			TaskStatus: state.Status, TaskPaused: paused, TaskQueued: state.Queued,
@@ -48,9 +52,13 @@ func (s *Server) instructionStatusReader(t *Task, segment int, currentID int64) 
 		for i := range messages {
 			msg := &messages[i]
 			receipt := instructionStatusReceipt(msg, page.ObservedAt, plannerWait, mainWait)
+			if msg.DeliveryOwner == "planner" && (receipt.Delivery == "queued" || receipt.Delivery == "waiting") {
+				applyInstructionBlocker(&receipt, state.Status, state.Paused)
+			}
 			page.Items = append(page.Items, agent.InstructionStatus{
 				MessageID: msg.ID, Route: receipt.Route, Delivery: receipt.Delivery, Owner: msg.DeliveryOwner,
 				Reason: receipt.Reason, CreatedAt: msg.CreatedAt.UTC(), UpdatedAt: msg.UpdatedAt.UTC(),
+				TaskStatus: receipt.TaskStatus, RequiredAction: receipt.RequiredAction,
 			})
 		}
 		if err := readCtx.Err(); err != nil {
@@ -63,26 +71,26 @@ func (s *Server) instructionStatusReader(t *Task, segment int, currentID int64) 
 // All inputs are already observed metadata. This conversion intentionally does
 // no I/O, so one response cannot repeat contextless eligibility queries for each
 // queued item. Provider availability remains explicitly unknown.
-func instructionStatusWaitingReasons(state taskLifecycleState, paused, started, settling, openGoal, activeIntent bool) (planner, main string) {
+func instructionStatusWaitingReasons(state taskLifecycleState, paused, started, settling, openGoal, activeIntent, pending bool) (planner, main string) {
 	switch {
-	case paused:
-		main = "Task is paused; request saved until it is resumed."
 	case state.Queued:
 		main = "Task is queued; request saved until it starts."
+	case paused:
+		main = "Task is paused; request saved until it is resumed."
 	case settling:
 		main = "Task is winding down; request remains saved."
 	}
 	switch {
 	case isTerminalStatus(state.Status):
-		planner = "Task is completed; waiting for an eligible Planner round."
-	case paused:
-		planner = "Task is paused; waiting until it is resumed."
+		planner = terminalInstructionReason(state.Status)
 	case state.Queued:
 		planner = "Task is queued; waiting until it starts."
+	case paused:
+		planner = "Task is paused; waiting until it is resumed."
 	case settling:
 		planner = "Task is winding down; instruction remains saved."
-	case !openGoal && !activeIntent:
-		planner = "Task has no open goals or active intents; waiting for an eligible Planner round."
+	case !openGoal && !activeIntent && !pending:
+		planner = "Task has no open work or pending Planner instructions."
 	case !started:
 		planner = "Task engine is not running; instruction remains saved."
 	}

@@ -29,7 +29,7 @@ func WithMainTurnPolicy(ctx context.Context, policy MainTurnPolicy) context.Cont
 
 func mainAdministrativeTool(name string) bool {
 	switch name {
-	case "set_goals", "set_constraints", "add_task_scope", "add_company_scope":
+	case "set_goals", "set_constraints", "add_task_scope", "add_company_scope", "wake_planner", "continue_task":
 		return true
 	}
 	return false
@@ -56,10 +56,18 @@ func (t mainFencedTool) Call(ctx context.Context, input json.RawMessage, tc *act
 
 // Called after canonical role reconstruction: resolver additions cannot bypass
 // this per-turn policy. An untagged internal/legacy caller keeps the existing
-// capability set; every production chat is tagged by the server.
+// capability set except lifecycle controls, which always require a tagged
+// administrative owner. Every production chat is tagged by the server.
 func enforceMainTurnPolicy(ctx context.Context, opts *agentcore.Options) {
 	policy, tagged := ctx.Value(mainTurnPolicyKey{}).(MainTurnPolicy)
 	if !tagged {
+		allowed := make([]actool.CoreTool, 0, len(opts.Tools))
+		for _, tool := range opts.Tools {
+			if !mainLifecycleToolName(tool.Name()) {
+				allowed = append(allowed, tool)
+			}
+		}
+		opts.Tools = allowed
 		return
 	}
 	controls := map[string]bool{}

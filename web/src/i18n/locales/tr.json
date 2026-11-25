@@ -2780,5 +2780,21 @@
   "Saved by": "Kaydeden",
   "Intent #{id}": "Niyet #{id}",
   "Original file": "Özgün dosya",
-  "Preview contents": "İçeriği önizle"
+  "Preview contents": "İçeriği önizle",
+  "Task timed out or reached its run limit. Planner is stopped; saved instructions cannot run until you continue the task.": "Görev zaman aşımına uğradı veya çalışma sınırına ulaştı. Planlayıcı durdu; görevi devam ettirene kadar kaydedilen talimatlar çalışamaz.",
+  "Task completed. Planner is stopped; saved instructions cannot run until you continue the task.": "Görev tamamlandı. Planlayıcı durdu; görevi devam ettirene kadar kaydedilen talimatlar çalışamaz.",
+  "Task failed. Planner is stopped; saved instructions cannot run until you continue the task.": "Görev başarısız oldu. Planlayıcı durdu; görevi devam ettirene kadar kaydedilen talimatlar çalışamaz.",
+  "Task timed out or reached its run limit — instruction blocked": "Görev zaman aşımına uğradı veya çalışma sınırına ulaştı — talimat engellendi",
+  "Task completed — instruction blocked": "Görev tamamlandı — talimat engellendi",
+  "Task failed — instruction blocked": "Görev başarısız oldu — talimat engellendi",
+  "Instruction blocked — task action required": "Talimat engellendi — görev üzerinde işlem gerekiyor",
+  "Continue task": "Göreve devam et",
+  "Wake Planner": "Planlayıcıyı uyandır",
+  "Save for Planner": "Planlayıcı için kaydet",
+  "Continue this task through the run queue so Planner can review saved instructions. Existing messages are kept.": "Planlayıcının kaydedilen talimatları inceleyebilmesi için bu görevi çalışma kuyruğu üzerinden devam ettirin. Mevcut mesajlar korunur.",
+  "Task queued. Planner will review saved instructions after admission.": "Görev kuyruğa alındı. Planlayıcı, görev çalışmaya kabul edildikten sonra kaydedilen talimatları inceleyecek.",
+  "Planner wake requested. Instruction delivery remains tracked separately.": "Planlayıcıyı uyandırma isteği gönderildi. Talimat teslimi ayrı olarak izlenmeye devam ediyor.",
+  "Task continued. Saved instructions are awaiting Planner review.": "Görev devam ettirildi. Kaydedilen talimatlar Planlayıcının incelemesini bekliyor.",
+  "Instructions are waiting for Planner. A wake requests a review; it does not confirm that work was applied.": "Talimatlar Planlayıcıyı bekliyor. Uyandırma, inceleme talep eder; işin uygulandığını doğrulamaz.",
+  "Last task control response:": "Son görev kontrolü yanıtı:"
 }

@@ -138,7 +138,7 @@ func TestPlannerInstructionAPIUsesTypedQueueAndIdempotency(t *testing.T) {
 
 func TestPlannerInstructionPreservesLifecycleAndRejectsUnacceptedMessages(t *testing.T) {
 	s, task := plannerBridgeFixture(t)
-	for _, status := range []string{"paused", "done", "queued"} {
+	for _, status := range []string{"paused", "done", "failed", "timeout", "queued"} {
 		task.updateLifecycle(func(state *taskLifecycleState) {
 			state.Status, state.Paused, state.Queued = status, status == "paused", status == "queued"
 		})
@@ -147,7 +147,14 @@ func TestPlannerInstructionPreservesLifecycleAndRejectsUnacceptedMessages(t *tes
 		var receipt mainMessageReceipt
 		_ = json.Unmarshal(w.Body.Bytes(), &receipt)
 		after := task.lifecycleSnapshot()
-		if w.Code != http.StatusCreated || receipt.Delivery != "waiting" || receipt.Reason == "" || after.Status != before.Status || after.Paused != before.Paused || after.Queued != before.Queued {
+		wantDelivery := "waiting"
+		if isTerminalStatus(status) {
+			wantDelivery = "blocked"
+			if receipt.TaskStatus != status || receipt.RequiredAction != "restart" {
+				t.Fatalf("terminal continuation metadata missing: %+v", receipt)
+			}
+		}
+		if w.Code != http.StatusCreated || receipt.Delivery != wantDelivery || receipt.Reason == "" || after.Status != before.Status || after.Paused != before.Paused || after.Queued != before.Queued {
 			t.Fatalf("state=%s response=%d %s before=%+v after=%+v", status, w.Code, w.Body, before, after)
 		}
 	}
@@ -158,7 +165,7 @@ func TestPlannerInstructionPreservesLifecycleAndRejectsUnacceptedMessages(t *tes
 	w := plannerBridgeRequest(s, task, true, "No new goal implied")
 	var receipt mainMessageReceipt
 	_ = json.Unmarshal(w.Body.Bytes(), &receipt)
-	if w.Code != http.StatusCreated || receipt.Delivery != "waiting" || !strings.Contains(receipt.Reason, "no open goals") {
+	if w.Code != http.StatusCreated || receipt.Delivery != "queued" {
 		t.Fatalf("goalless response=%d %s", w.Code, w.Body)
 	}
 	before, _ := task.Store.ListByKind(db.KindHint, 100)

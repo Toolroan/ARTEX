@@ -14,6 +14,7 @@ import {
   Loader2Icon,
   PaperclipIcon,
   PauseIcon,
+  PlayIcon,
   PlusIcon,
   RadioIcon,
   RotateCwIcon,
@@ -51,7 +52,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { intlLocale, t } from "@/i18n";
-import { api, type MainRoutingMode, type PlannerDelivery, sseUrl } from "@/lib/api";
+import { api, type MainRoutingMode, type PlannerDelivery, type TaskControlAction, sseUrl } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import {
   type RoutingRequest,
@@ -63,6 +64,7 @@ import { MOCK } from "@/lib/mock/enabled";
 import { setVisibleInterval } from "@/lib/polling";
 import { isBtwCommand } from "@/lib/side-questions";
 import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
+import { canWakePlanner, terminalTaskNotice } from "@/lib/task-continuation";
 import type {
   Activity,
   ChatAttachment,
@@ -74,6 +76,7 @@ import type {
   TaskLLMResolution,
   TaskLLMResolutions,
   TaskNode,
+  TaskStatus,
   TokenTotal,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -505,7 +508,23 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
   );
 }
 
-export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; taskPaused?: boolean }) {
+export function SessionsTab({
+  taskId,
+  taskPaused = false,
+  taskQueued = false,
+  taskStatus,
+  controlPending = false,
+  controlBlockedReason,
+  onTaskControl,
+}: {
+  taskId: string;
+  taskPaused?: boolean;
+  taskQueued?: boolean;
+  taskStatus?: TaskStatus;
+  controlPending?: boolean;
+  controlBlockedReason?: string;
+  onTaskControl?: (action: TaskControlAction) => Promise<void>;
+}) {
   const approvalFocus = useApprovalFocus({ taskId });
   const [selectedSessionId, setActiveId] = React.useState(MAIN_ID);
   const focusSession = React.useMemo<Session | undefined>(() => {
@@ -1335,6 +1354,18 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const routingSeg = isMain ? (active.seg ?? 0) : currentSeg;
   const routingScope = `${taskId}:${routingSeg}`;
   const visibleRoutingReceipts = routingReceipts.scope === routingScope ? routingReceipts.items : [];
+  const terminalNotice = terminalTaskNotice(taskStatus);
+  const showPlannerWake =
+    !routingUnavailable && canWakePlanner(taskStatus, taskPaused, taskQueued, visibleRoutingReceipts);
+  let instructionControlAction: TaskControlAction = "wake";
+  let instructionControlLabel = t("Wake Planner");
+  if (terminalNotice) {
+    instructionControlAction = "restart";
+    instructionControlLabel = t("Continue task");
+  } else if (taskPaused) {
+    instructionControlAction = "resume";
+    instructionControlLabel = t("Resume");
+  }
   React.useEffect(() => {
     if (!isMain && !isPlanner) return;
     let alive = true;
@@ -1362,7 +1393,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       alive = false;
       cleanup();
     };
-  }, [taskId, routingSeg, routingScope, isMain, isPlanner]);
+  }, [taskId, routingSeg, routingScope, isMain, isPlanner, taskStatus, taskPaused, taskQueued]);
 
   function rememberRoutingReceipt(receipt: PlannerDelivery, scope: string, text?: string) {
     routingVersionRef.current++;
@@ -2108,6 +2139,57 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 )}
               </div>
             </ScrollArea>
+            {(isMain || isPlanner) &&
+              (terminalNotice || taskPaused || taskQueued || showPlannerWake || controlBlockedReason) && (
+                <div className="flex items-start gap-3 border-t bg-muted/30 px-3 py-2.5 text-xs" role="status">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    {terminalNotice && (
+                      <>
+                        <p>{t(terminalNotice)}</p>
+                        <p className="text-muted-foreground">
+                          {t(
+                            "Continue this task through the run queue so Planner can review saved instructions. Existing messages are kept.",
+                          )}
+                        </p>
+                      </>
+                    )}
+                    {!terminalNotice && taskPaused && (
+                      <p>{t("Task paused. Instructions are saved until you resume it.")}</p>
+                    )}
+                    {!terminalNotice && !taskPaused && taskQueued && (
+                      <p>{t("Task queued. Planner will review saved instructions after admission.")}</p>
+                    )}
+                    {!terminalNotice && !taskPaused && !taskQueued && showPlannerWake && (
+                      <p>
+                        {t(
+                          "Instructions are waiting for Planner. A wake requests a review; it does not confirm that work was applied.",
+                        )}
+                      </p>
+                    )}
+                    {controlBlockedReason && (
+                      <p className="text-muted-foreground">
+                        {t("Last task control response:")} {controlBlockedReason}
+                      </p>
+                    )}
+                  </div>
+                  {onTaskControl && (terminalNotice || taskPaused || showPlannerWake) && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 shrink-0 px-2 text-xs"
+                      disabled={controlPending}
+                      onClick={() => void onTaskControl(instructionControlAction)}
+                    >
+                      {controlPending ? (
+                        <Loader2Icon className="size-3 animate-spin" />
+                      ) : (
+                        <PlayIcon className="size-3" />
+                      )}
+                      {instructionControlLabel}
+                    </Button>
+                  )}
+                </div>
+              )}
             {(isMain || isPlanner) && (visibleRoutingReceipts.length > 0 || routingUnavailable) && (
               <div className="space-y-2 border-t bg-muted/20 px-3 py-2 text-xs" aria-live="polite">
                 {visibleRoutingReceipts.map((receipt) => (
@@ -2121,6 +2203,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                           "min-w-0 flex-1",
                           receipt.delivery === "routing_failed" && "text-destructive",
                           receipt.delivery === "needs_review" && "text-amber-700 dark:text-amber-400",
+                          receipt.delivery === "blocked" && "text-amber-700 dark:text-amber-400",
                         )}
                       >
                         {plannerDeliveryLabel(receipt)}
@@ -2273,11 +2356,6 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 <p className="mb-2 text-xs text-muted-foreground" role="status">
                   {t("Send corrections directly to Planner, including while Main is busy.")}
                 </p>
-                {taskPaused && (
-                  <p className="mb-2 text-xs text-muted-foreground">
-                    {t("Task paused. Instructions are saved until you resume it.")}
-                  </p>
-                )}
                 <InputGroup className="min-h-9 has-disabled:opacity-100">
                   <InputGroupTextarea
                     rows={2}
@@ -2310,7 +2388,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                       }
                     >
                       {plannerMessageSending ? <Loader2Icon className="animate-spin" /> : <ArrowUpIcon />}
-                      {t("Send to Planner")}
+                      {terminalNotice ? t("Save for Planner") : t("Send to Planner")}
                     </InputGroupButton>
                   </InputGroupAddon>
                 </InputGroup>

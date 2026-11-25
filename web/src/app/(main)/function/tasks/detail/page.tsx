@@ -5,7 +5,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
+import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { StatusBadge } from "@/components/status-badge";
@@ -37,7 +37,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { t } from "@/i18n";
-import { api } from "@/lib/api";
+import { api, type TaskControlAction } from "@/lib/api";
+import { isTerminalTask } from "@/lib/task-continuation";
 import type { LLMProfile, Task } from "@/lib/types";
 
 import { ArtifactsTab } from "./_tabs/artifacts-tab";
@@ -105,7 +106,11 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
       : (activeProfile?.name ?? (activeID ? t("Config #{id}", { id: activeID }) : t("Follow default config")));
   const activeIndex = chain.indexOf(activeID);
   const backupCount = activeIndex >= 0 ? Math.max(0, chain.length - activeIndex - 1) : 0;
-  const currentTitle = [currentLabel, activeProfile?.model, backupCount > 0 ? t("{count} backups", { count: backupCount }) : ""]
+  const currentTitle = [
+    currentLabel,
+    activeProfile?.model,
+    backupCount > 0 ? t("{count} backups", { count: backupCount }) : "",
+  ]
     .filter(Boolean)
     .join(" · ");
   let editorDescription = t(
@@ -171,7 +176,9 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
         >
           <BrainIcon data-icon="inline-start" />
           <span className="hidden max-w-36 truncate lg:inline">{currentLabel}</span>
-          {!task.llm_rotate && backupCount > 0 && <span className="hidden text-muted-foreground xl:inline">+{backupCount}</span>}
+          {!task.llm_rotate && backupCount > 0 && (
+            <span className="hidden text-muted-foreground xl:inline">+{backupCount}</span>
+          )}
         </Button>
       </PopoverTrigger>
       <PopoverContent ref={popoverContentRef} align="start" className="w-[min(28rem,calc(100vw-2rem))] gap-4 p-4">
@@ -231,6 +238,12 @@ function TaskDetailInner() {
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);
+  const [controllingTask, setControllingTask] = React.useState<string | null>(null);
+  const [controlNotice, setControlNotice] = React.useState<{ taskId: string; reason: string } | null>(null);
+  const taskControlInFlight = React.useRef<string | null>(null);
+  const taskStateVersion = React.useRef(0);
+  const currentTaskId = React.useRef(id);
+  currentTaskId.current = id;
 
   React.useEffect(() => {
     api
@@ -260,11 +273,13 @@ function TaskDetailInner() {
 
   const taskLoadInFlight = React.useRef<string | null>(null);
   const load = React.useCallback(() => {
-    if (taskLoadInFlight.current === id) return;
+    if (taskLoadInFlight.current === id || taskControlInFlight.current === id) return;
     taskLoadInFlight.current = id;
+    const version = taskStateVersion.current;
     Promise.all([api.task(id), api.stats(id).catch(() => null)])
       .then(([task, s]) => {
-        if (taskLoadInFlight.current !== id) return;
+        if (taskLoadInFlight.current !== id || currentTaskId.current !== id || taskStateVersion.current !== version)
+          return;
         const base = { ...task };
         const at = s?.active_task;
         if (at) {
@@ -293,15 +308,40 @@ function TaskDetailInner() {
     return stopPolling;
   }, [load]);
 
-  async function togglePause() {
-    if (task && ["done", "failed", "timeout"].includes(task.status)) return;
-    const next = !paused;
+  async function controlTask(action: TaskControlAction) {
+    if (task?.id !== id || taskControlInFlight.current !== null) return;
+    taskControlInFlight.current = id;
+    setControllingTask(id);
+    setControlNotice(null);
+    taskStateVersion.current++;
     try {
-      await api.controlTask(id, next ? "pause" : "resume");
-      setPaused(next);
-      toast.success(next ? t("Exploration paused") : t("Exploration resumed"));
+      const result = await api.controlTask(id, action);
+      if (currentTaskId.current !== id) return;
+      taskStateVersion.current++;
+      setTask((previous) =>
+        previous?.id === id
+          ? { ...previous, status: result.status, paused: result.paused, queued: result.queued }
+          : previous,
+      );
+      setPaused(result.paused);
+      if (result.blocked_reason) {
+        setControlNotice({ taskId: id, reason: result.blocked_reason });
+        toast.info(result.blocked_reason);
+      } else if (result.queued) {
+        toast.success(t("Task queued. Planner will review saved instructions after admission."));
+      } else if (action === "wake") {
+        toast.success(t("Planner wake requested. Instruction delivery remains tracked separately."));
+      } else if (action === "restart") {
+        toast.success(t("Task continued. Saved instructions are awaiting Planner review."));
+      } else {
+        toast.success(action === "pause" ? t("Exploration paused") : t("Exploration resumed"));
+      }
     } catch (e) {
-      toast.error(t("Operation failed: {error}", { error: (e as Error).message }));
+      if (currentTaskId.current === id) toast.error(t("Operation failed: {error}", { error: (e as Error).message }));
+    } finally {
+      taskControlInFlight.current = null;
+      setControllingTask(null);
+      if (currentTaskId.current === id) load();
     }
   }
 
@@ -321,7 +361,9 @@ function TaskDetailInner() {
   if (!task) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-10 text-center">
-        <p className="text-muted-foreground">{loaded ? t("Task {id} was deleted, archived, or does not exist", { id }) : t("Loading…")}</p>
+        <p className="text-muted-foreground">
+          {loaded ? t("Task {id} was deleted, archived, or does not exist", { id }) : t("Loading…")}
+        </p>
         {loaded && (
           <Button asChild variant="outline">
             <Link href="/function/tasks">
@@ -333,29 +375,38 @@ function TaskDetailInner() {
     );
   }
 
-  const completed = task.status === "done";
-  const terminal = ["done", "failed", "timeout"].includes(task.status);
-  const archiveLifecycleEligible = terminal || paused || task.status === "paused";
+  const terminal = isTerminalTask(task.status);
+  const taskIsQueued = task.status === "queued" || task.queued === true;
+  const taskIsPaused = !taskIsQueued && (task.status === "paused" || paused);
+  const controlPending = controllingTask === id;
+  const archiveLifecycleEligible = terminal || taskIsPaused;
   const canArchive = archiveLifecycleEligible && !task.archive_blocked_by_task_id;
-  let archiveDisabledReason = task.queued ? t("Queued tasks must be paused first") : t("Running tasks must be paused first");
+  let archiveDisabledReason = task.queued
+    ? t("Queued tasks must be paused first")
+    : t("Running tasks must be paused first");
   if (archiveLifecycleEligible && task.archive_blocked_by_task_id) {
     archiveDisabledReason = t(
       "The task is directly inherited by unarchived task #{id}; archive the dependent task first",
       { id: task.archive_blocked_by_task_id },
     );
   }
-  const engineMode = paused ? "paused" : (task.engine_mode ?? "idle");
+  const engineMode = taskIsPaused ? "paused" : (task.engine_mode ?? "idle");
+  const headerStatus = taskIsQueued ? "queued" : task.status;
+  const showTaskStatus = terminal || taskIsQueued;
   let controlVariant: "default" | "secondary" | "outline" = "outline";
   let controlIcon = <PauseIcon data-icon="inline-start" />;
   let controlLabel = t("Pause");
+  let controlAction: TaskControlAction = "pause";
   if (terminal) {
-    controlVariant = "secondary";
-    controlIcon = <CheckIcon data-icon="inline-start" />;
-    controlLabel = completed ? t("Completed") : t("Ended");
-  } else if (paused) {
+    controlVariant = "default";
+    controlIcon = <PlayIcon data-icon="inline-start" />;
+    controlLabel = t("Continue task");
+    controlAction = "restart";
+  } else if (taskIsPaused) {
     controlVariant = "default";
     controlIcon = <PlayIcon data-icon="inline-start" />;
     controlLabel = t("Resume");
+    controlAction = "resume";
   }
   const archiveTrigger = (
     <Button
@@ -387,7 +438,11 @@ function TaskDetailInner() {
           </code>
           <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
           <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
-          <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />
+          <StatusBadge
+            domain={showTaskStatus ? "task" : "engine"}
+            value={showTaskStatus ? headerStatus : engineMode}
+            dot
+          />
           {canArchive ? (
             <AlertDialog>
               <AlertDialogTrigger asChild>{archiveTrigger}</AlertDialogTrigger>
@@ -396,7 +451,7 @@ function TaskDetailInner() {
                   <AlertDialogTitle>{t("Archive task #{id}?", { id: task.id })}</AlertDialogTitle>
                   <AlertDialogDescription>
                     {t(
-                      "The task graph, related records, exclusive assets and traffic, working files, and LLM history will be compressed into cold storage. Once archiving completes, restore it from the \"Archived\" tab of the task list.",
+                      'The task graph, related records, exclusive assets and traffic, working files, and LLM history will be compressed into cold storage. Once archiving completes, restore it from the "Archived" tab of the task list.',
                     )}
                   </AlertDialogDescription>
                 </AlertDialogHeader>
@@ -414,8 +469,13 @@ function TaskDetailInner() {
               <TooltipContent>{archiveDisabledReason}</TooltipContent>
             </Tooltip>
           )}
-          <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal}>
-            {controlIcon}
+          <Button
+            size="sm"
+            variant={controlVariant}
+            onClick={() => void controlTask(controlAction)}
+            disabled={controlPending}
+          >
+            {controlPending ? <Spinner data-icon="inline-start" /> : controlIcon}
             {controlLabel}
           </Button>
         </div>
@@ -440,7 +500,16 @@ function TaskDetailInner() {
       {/* Tab content */}
       <div className="flex-1 p-4 lg:p-6">
         <TabsContent value="sessions" className="mt-0">
-          <SessionsTab key={id} taskId={id} taskPaused={task?.status === "paused"} />
+          <SessionsTab
+            key={id}
+            taskId={id}
+            taskStatus={task.status}
+            taskPaused={taskIsPaused}
+            taskQueued={taskIsQueued}
+            controlPending={controlPending}
+            controlBlockedReason={controlNotice?.taskId === id ? controlNotice.reason : undefined}
+            onTaskControl={controlTask}
+          />
         </TabsContent>
         <TabsContent value="overview" className="mt-0">
           <OverviewTab taskId={id} />

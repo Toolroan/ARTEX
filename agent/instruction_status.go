@@ -14,13 +14,15 @@ import (
 // InstructionStatus is delivery metadata, never operator text or an application
 // acknowledgment. A reviewed request may have changed nothing in a worker.
 type InstructionStatus struct {
-	MessageID int64     `json:"message_id"`
-	Route     string    `json:"route"`
-	Delivery  string    `json:"delivery"`
-	Owner     string    `json:"owner"`
-	Reason    string    `json:"reason"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	MessageID      int64     `json:"message_id"`
+	Route          string    `json:"route"`
+	Delivery       string    `json:"delivery"`
+	Owner          string    `json:"owner"`
+	Reason         string    `json:"reason"`
+	TaskStatus     string    `json:"task_status,omitempty"`
+	RequiredAction string    `json:"required_action,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type InstructionStatusPage struct {

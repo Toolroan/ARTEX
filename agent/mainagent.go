@@ -131,6 +131,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	if tool := instructionStatusTool(ctx); tool != nil {
 		trusted = append(trusted, tool)
 	}
+	trusted = append(trusted, mainLifecycleTools(ctx)...)
 	tools := append(trusted[:0:0], trusted...)
 	if resolve := ToolResolve(); resolve != nil {
 		tools = resolve(ctx, "mainagent", tools)

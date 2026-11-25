@@ -15,10 +15,15 @@ import (
 const maxBatchControlIDs = 100
 
 type taskControlResult struct {
-	ID     string `json:"id"`
-	Paused bool   `json:"paused"`
-	Queued bool   `json:"queued"`
-	Status string `json:"status"`
+	ID            string `json:"id"`
+	Paused        bool   `json:"paused"`
+	Queued        bool   `json:"queued"`
+	Status        string `json:"status"`
+	Action        string `json:"action,omitempty"`
+	WakeSent      bool   `json:"wake_sent,omitempty"`
+	AlreadyActive bool   `json:"already_active,omitempty"`
+	BlockedReason string `json:"blocked_reason,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 type intentControlResult struct {
@@ -135,6 +140,8 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		s.cancelTaskChat(t.ID, agent.AbortChatPausedWithTask)
 		out.Paused, out.Status = true, "paused"
 		go s.reconcileConcurrency()
+	case "wake", "restart":
+		return s.applyTaskLifecycleControl(t, action)
 	case "resume":
 		queued, err := s.admitPausedTask(t)
 		if err != nil {
@@ -143,7 +150,7 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		out.Queued = queued
 		out.Status = map[bool]string{true: "queued", false: "running"}[queued]
 	default:
-		return out, fmt.Errorf("action must be pause|resume")
+		return out, fmt.Errorf("action must be pause|resume|wake|restart")
 	}
 	log.Printf("[task] #%s %s", t.ID, map[string]string{"pause": "paused", "resume": "resumed"}[action])
 	return out, nil

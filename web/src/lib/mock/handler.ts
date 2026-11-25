@@ -2,7 +2,7 @@
 // Unmatched routes always return safe defaults ([] / {} / {ok:true}) so no page ever crashes.
 // Only entered via the http() short-circuit in api.ts when NEXT_PUBLIC_MOCK=1.
 
-import type { PlannerDelivery } from "../api";
+import type { PlannerDelivery, TaskControlAction } from "../api";
 import { ARTIFACT_CATEGORIES } from "../collected-artifacts";
 import {
   classifyCompanyScopeLine,
@@ -39,6 +39,7 @@ import type {
   TrafficEvidenceSnapshot,
 } from "../types";
 import { artifactFixtures, artifactPreviewFixtures } from "./artifact-fixtures";
+import { applyMockTaskControl, mockReceiptForTask } from "./task-continuation";
 import * as D from "./data";
 
 const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
@@ -48,7 +49,31 @@ const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 const mockInterceptHistory = structuredClone(D.interceptHistory);
 const mockInterceptPending = structuredClone(D.interceptPending);
 const mockInterceptDetails = structuredClone(D.interceptDetails);
-const mockTasks = structuredClone(D.tasks);
+const mockTasks: Task[] = structuredClone([
+  ...D.tasks,
+  {
+    id: "t-timeout-fixture",
+    name: "Timed-out instruction fixture",
+    description: "Synthetic task lifecycle example",
+    goal: "Review saved synthetic instructions",
+    status: "timeout",
+    created_at: "2026-11-20T00:00:00Z",
+    paused: false,
+    queued: false,
+    engine_mode: "idle",
+  },
+  {
+    id: "t-failed-fixture",
+    name: "Failed instruction fixture",
+    description: "Synthetic task lifecycle example",
+    goal: "Review saved synthetic instructions",
+    status: "failed",
+    created_at: "2026-11-20T00:00:00Z",
+    paused: false,
+    queued: false,
+    engine_mode: "idle",
+  },
+]);
 const mockCollectedArtifacts: Record<string, CollectedArtifact[]> = { "t-acme-web": structuredClone(artifactFixtures) };
 const mockArtifactPreviews: Record<string, Record<string, CollectedArtifactPreview>> = {
   "t-acme-web": structuredClone(artifactPreviewFixtures),
@@ -60,7 +85,7 @@ const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
-let mockPlannerInstructionId = 10002;
+let mockPlannerInstructionId = 10005;
 const mockMessageRoutes: {
   taskId: string;
   seg: number;
@@ -87,6 +112,42 @@ const mockMessageRoutes: {
       text: "Synthetic correction: keep the existing scope",
     },
   },
+  {
+    taskId: "t-timeout-fixture",
+    seg: 0,
+    requestId: "fixture-timeout",
+    fingerprint: "fixture-timeout",
+    receipt: {
+      message_id: 10003,
+      route: "correction",
+      delivery: "queued",
+      text: "Synthetic instruction: review the saved fixture before starting new work",
+    },
+  },
+  {
+    taskId: "t-failed-fixture",
+    seg: 0,
+    requestId: "fixture-failed",
+    fingerprint: "fixture-failed",
+    receipt: {
+      message_id: 10004,
+      route: "correction",
+      delivery: "queued",
+      text: "Synthetic instruction: review the saved fixture before starting new work",
+    },
+  },
+  {
+    taskId: "t-vpn-edge",
+    seg: 0,
+    requestId: "fixture-done",
+    fingerprint: "fixture-done",
+    receipt: {
+      message_id: 10005,
+      route: "correction",
+      delivery: "queued",
+      text: "Synthetic instruction: review the saved fixture before starting new work",
+    },
+  },
 ];
 
 function acceptMockMainMessage(taskId: string, body: Record<string, unknown>, directPlanner = false): PlannerDelivery {
@@ -106,7 +167,7 @@ function acceptMockMainMessage(taskId: string, body: Record<string, unknown>, di
   const existing = mockMessageRoutes.find((item) => item.taskId === taskId && item.requestId === requestId);
   if (existing) {
     if (existing.fingerprint !== fingerprint) throw new Error("Request ID already belongs to a different message");
-    return existing.receipt;
+    return mockReceiptForTask(existing.receipt, task);
   }
   // Demo-only fixtures. Real Auto routing is performed by the backend router.
   const instruction =
@@ -130,7 +191,7 @@ function acceptMockMainMessage(taskId: string, body: Record<string, unknown>, di
       : {}),
   };
   mockMessageRoutes.push({ taskId, seg, requestId, fingerprint, receipt });
-  return receipt;
+  return mockReceiptForTask(receipt, task);
 }
 
 // ── related traffic evidence (finding traffic) ─────────────────────────────────────────────
@@ -1026,30 +1087,15 @@ function sendMockWorkerMessage(
   };
 }
 
-function controlMockTask(id: string, action: "pause" | "resume"): BatchControlItem {
+function controlMockTask(id: string, action: TaskControlAction): BatchControlItem {
   const task = mockTasks.find((item) => item.id === id);
   if (!task) return { id, ok: false, error: "task not found" };
-  if (task.status === "done" || task.status === "failed" || task.status === "timeout") {
-    return { id, ok: false, status: task.status, error: "a task in a final state cannot be controlled" };
+  try {
+    const result = applyMockTaskControl(task, action, id === "t-timeout-fixture");
+    return { ...result, ok: true };
+  } catch (error) {
+    return { id, ok: false, status: task.status, error: (error as Error).message };
   }
-  if (action === "pause") {
-    if (task.paused || task.status === "paused") {
-      return { id, ok: false, status: task.status, error: "task is already paused" };
-    }
-    task.paused = true;
-    task.queued = false;
-    task.status = "paused";
-    task.engine_mode = "paused";
-  } else {
-    if (!task.paused && task.status !== "paused") {
-      return { id, ok: false, status: task.status, error: "task is not paused" };
-    }
-    task.paused = false;
-    task.queued = false;
-    task.status = "running";
-    task.engine_mode = "exploring";
-  }
-  return { id, ok: true, status: task.status, queued: false };
 }
 
 function sortMockConversations() {
@@ -1595,11 +1641,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     };
   }
   if (seg[0] === "tasks" && seg.length === 3 && seg[2] === "control" && m === "POST") {
-    const action = b.action === "resume" ? "resume" : "pause";
-    const result = controlMockTask(seg[1], action);
-    if (!result.ok) throw new Error(result.error ?? "task state has changed");
+    if (!["pause", "resume", "restart", "wake"].includes(String(b.action)))
+      throw new Error("Unknown task control action");
     const task = mockTasks.find((item) => item.id === seg[1]);
-    return { id: seg[1], paused: Boolean(task?.paused), queued: Boolean(task?.queued), status: task?.status ?? "" };
+    if (!task) throw new Error("task not found");
+    return applyMockTaskControl(task, b.action as TaskControlAction, task.id === "t-timeout-fixture");
   }
   if (seg[0] === "tasks" && seg[2] === "chat" && seg[3] === "status") return { running: false };
   if (seg[0] === "tasks" && seg[2] === "chat" && seg[3] === "stop") return { status: "stopped" };
@@ -1608,7 +1654,12 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return {
       items: mockMessageRoutes
         .filter((item) => item.taskId === seg[1] && item.seg === segment)
-        .map((item) => item.receipt)
+        .map((item) =>
+          mockReceiptForTask(
+            item.receipt,
+            mockTasks.find((task) => task.id === seg[1]),
+          ),
+        )
         .sort((a, b) => b.message_id - a.message_id),
     };
   }

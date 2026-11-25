@@ -1069,14 +1069,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			return false
 		} // never lose a pending instruction on a failed read
 		instructionOnly := false
-		// goalless (human direct-inject) branch: when the task has no open goals the
-		// planner does not run — running it would re-judge met→cancelExec and kill intents
-		// the user injected directly via the main agent. Whether to end is decided by the
-		// frontier instead: open/running intents remain → stay running and wait silently; intents all drained → land in done. The whole branch is pure Go, triggers no LLM calls, and writes no planning-round marker.
+		// Goalless tasks only plan when an explicit typed instruction is queued.
+		// Instruction-only mode cannot judge completion or invent autonomous work,
+		// including when a restarted task has no remaining active intents. Otherwise
+		// the frontier decides completion without an LLM call.
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
-			active, activeErr := t.Store.HasActiveIntent()
-			if queuedInstructions && activeErr == nil && active {
-				instructionOnly = true // corrections to a running one-off still reach Planner
+			if queuedInstructions {
+				instructionOnly = true
 			} else {
 				t.drainTriggers() // discard accumulated done/finding triggers to avoid unbounded growth in long goalless sessions
 				if active, err := t.Store.HasActiveIntent(); err == nil && !active {
@@ -1159,7 +1158,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		queueCheck, stopQueueCheck := context.WithTimeout(context.WithoutCancel(ectx), 5*time.Second)
 		pending, readErr := t.Store.HasQueuedPlannerMessages(queueCheck)
 		stopQueueCheck()
-		if readErr == nil && pending {
+		if readErr == nil && (pending || instructionOnly) {
+			// Recheck a drained goalless inbox promptly. The next round either
+			// reviews another explicit message, waits for its workers, or settles
+			// without making another autonomous Planner call.
 			t.Notify()
 		}
 		if !deliveryHealthy {
@@ -1310,7 +1312,7 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 // runIntent. Returns false when nothing was claimable. The pool worker loop is its
 // only caller.
 func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker *agent.Worker) bool {
-	intent, token := e.claimNext(t, name)
+	intent, token := e.claimNextContext(ctx, t, name)
 	if intent == nil {
 		return false
 	}
@@ -1644,9 +1646,23 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 }
 
 func (e *Engine) claimNext(t *Task, name string) (*db.Node, string) {
-	fr, _ := t.Store.Frontier(20)
+	return e.claimNextContext(context.Background(), t, name)
+}
+
+func (e *Engine) claimNextContext(ctx context.Context, t *Task, name string) (*db.Node, string) {
+	ctx, stop := context.WithTimeout(ctx, 5*time.Second)
+	defer stop()
+	fr, err := t.Store.FrontierContext(ctx, 20)
+	if err != nil {
+		return nil, ""
+	}
 	for _, in := range fr {
-		if token, _ := t.Store.ClaimIntentToken(in.ID, name); token != "" {
+		if ctx.Err() != nil {
+			return nil, ""
+		}
+		if token, err := t.Store.ClaimIntentTokenAfterPlannerReview(ctx, in.ID, name); err != nil {
+			return nil, ""
+		} else if token != "" {
 			return in, token
 		}
 	}
