@@ -4378,10 +4378,10 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				s.engine.emitActivity(t, rec)
 			}
 			resume := func() { s.reviveTask(t) } // set_goals added a goal → pulls the task back to running
-			// Splice the list of [absolute paths] of uploaded attachments into the message sent to the agent; it uses them to open files via Read/Bash.
+			// Give Main absolute attachment paths to include in delegated worker checks.
 			// mainDir = the main agent's run directory (its CWD, tasks/<id>/main), the same call as chatUpload's target dir and the agent itself.
 			mainDir := agent.EnsureRunDir(s.m.dir, maTaskID, 0)
-			agentMsg := composeAgentMessage(agentMessage, req.Attachments, mainDir)
+			agentMsg := composeMainAgentMessage(agentMessage, req.Attachments, mainDir)
 			receipt, _ := json.Marshal(plannerDelivery)
 			agentMsg += "\n\n[Server Planner handoff receipt for this user message]\n" + string(receipt) + "\nThe message is already saved. Notification is not proof that Planner or a worker has acted. Do not duplicate this unchanged message with add_hint."
 			// Tag the turn for the target gate: the task, the "mainagent" lane and the approval scope.

@@ -985,7 +985,10 @@ func takePlannerTriggers(t *Task, quietCandidate bool) ([]agent.TriggerEvent, bo
 	triggers := t.drainTriggers()
 	if quietCandidate {
 		for _, trigger := range triggers {
-			if (trigger.Kind == "hint" && trigger.HintOrigin == "human" && len(trigger.Hints) > 0) || trigger.Kind == "steering_unapplied" {
+			// Main may add missing paths or conversation context after the
+			// original human message already started a planning round. Wake for
+			// that handoff too; its agent origin and untrusted framing stay intact.
+			if (trigger.Kind == "hint" && (trigger.HintOrigin == "human" || trigger.HintOrigin == "mainagent") && len(trigger.Hints) > 0) || trigger.Kind == "steering_unapplied" {
 				return triggers, false
 			}
 		}

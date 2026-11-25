@@ -134,8 +134,11 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	opts := agentcore.Options{
-		Provider:       m.prov,
-		SystemPrompt:   []string{mainAgentSystem(goal, m.workDir, mainDir)},
+		Provider:     m.prov,
+		SystemPrompt: []string{mainAgentSystem(goal, m.workDir, mainDir)},
+		SystemReminderFunc: func() string {
+			return mainAgentTurnReminder(mainDir)
+		},
 		Tools:          tools,
 		PermissionMode: permission.ModeBypass,
 		WorkingDir:     mainDir,
