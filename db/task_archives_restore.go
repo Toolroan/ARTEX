@@ -168,6 +168,13 @@ func (d *DB) restoreTaskArchive(
 	if snapshot == nil || !IsTaskArchiveFormatSupported(snapshot.FormatVersion) {
 		return nil, ErrTaskArchiveFormatMismatch
 	}
+	if snapshot.FormatVersion >= 4 {
+		for _, table := range []string{"work_requests", "work_request_nodes"} {
+			if _, present := snapshot.Tables[table]; !present {
+				return nil, fmt.Errorf("%w: durable work table %s is missing", ErrTaskArchiveFormatMismatch, table)
+			}
+		}
+	}
 	streamedLLMRecords := snapshot.StreamedTables["llm_records"]
 	if (len(snapshot.StreamedTables) > 0 && snapshot.FormatVersion < 2) ||
 		len(snapshot.StreamedTables) > 1 ||
@@ -243,7 +250,7 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	}
 	// Insert graph rows in foreign-key order. The archived stub has no graph rows,
 	// so an ID conflict signals external corruption and must stop the restore.
-	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity", "main_message_routes"} {
+	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity", "main_message_routes", "work_requests", "work_request_nodes"} {
 		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
@@ -251,6 +258,17 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	// Restored leases cannot belong to a live process. Routing is tool-free and
 	// retryable; previously inflight effects require review instead of replay.
 	if _, err := tx.Exec(`UPDATE main_message_routes SET routing_status=CASE WHEN attempts<$2 THEN 'pending' ELSE 'failed' END,routing_token='',routing_until=NULL,retry_after=now(),last_error='Routing was interrupted by archive',updated_at=now() WHERE exploration_id=$1 AND routing_status='running'`, expID, MainRoutingMaxAttempts); err != nil {
+		return nil, err
+	}
+	// Preserve completed/cancelled dispositions and queued work. An unfinished
+	// request whose review was in flight cannot inherit that process's authority
+	// or automatically replay its effects after restore. Its stable allocations
+	// and graph links remain available for explicit reconciliation.
+	if _, err := tx.Exec(`UPDATE work_requests request
+SET state='blocked',resolution='Review interrupted; inspect existing effects before retrying',review_requested=false,updated_at=now()
+FROM main_message_routes message
+WHERE request.exploration_id=$1 AND request.id=message.id
+  AND message.delivery_status='inflight' AND request.state NOT IN ('completed','cancelled')`, expID); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(`UPDATE main_message_routes SET delivery_status='needs_review',delivery_token='',delivery_until=NULL,last_error='Delivery was interrupted by archive; review existing effects before retrying',updated_at=now() WHERE exploration_id=$1 AND delivery_status='inflight'`, expID); err != nil {
@@ -410,7 +428,7 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 		"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
 		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
 		"side_question_sessions": true, "side_question_requests": true,
-		"main_message_routes": true,
+		"main_message_routes": true, "work_requests": true, "work_request_nodes": true,
 	}
 	if !allowed[table] {
 		return fmt.Errorf("archive restore table %q is not allowed", table)

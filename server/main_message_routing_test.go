@@ -149,7 +149,7 @@ func makeMainOwnedFixture(t *testing.T, task *Task) *db.MainMessage {
 	return m
 }
 
-func TestMainOwnedRequestWaitsForResumeAndFencesOneOff(t *testing.T) {
+func TestMainOwnedRequestWaitsForResumeAndFencesRequestLease(t *testing.T) {
 	s, task := plannerBridgeFixture(t)
 	_, _ = s.m.pg.Exec(`UPDATE exploration_nodes SET state='met' WHERE exploration_id=$1 AND kind='goal'`, task.ExpID)
 	m := makeMainOwnedFixture(t, task)
@@ -173,12 +173,15 @@ func TestMainOwnedRequestWaitsForResumeAndFencesOneOff(t *testing.T) {
 	if result, err := policy.Execute(t.Context(), "add_intent", json.RawMessage(`{}`), run); err != nil || result.IsError {
 		t.Fatalf("first dispatch %v %+v", err, result)
 	}
-	if result, _ := policy.Execute(t.Context(), "add_intent", json.RawMessage(`{}`), run); !result.IsError || calls != 1 {
-		t.Fatal("one message dispatched twice")
+	if policy.Mode != "work_request" {
+		t.Fatalf("ordinary Main action mode = %q", policy.Mode)
+	}
+	if result, _ := policy.Execute(t.Context(), "set_goals", json.RawMessage(`{}`), run); result.IsError || calls != 2 {
+		t.Fatal("one explicit request must permit goal and intent creation under the same lease")
 	}
 	_, _ = s.m.pg.Exec(`UPDATE main_message_routes SET delivery_until=now()-interval '1 second' WHERE id=$1`, m.ID)
 	policy = s.mainMutationPolicy(task, m)
-	if result, _ := policy.Execute(t.Context(), "add_intent", json.RawMessage(`{}`), run); !result.IsError || calls != 1 {
+	if result, _ := policy.Execute(t.Context(), "add_intent", json.RawMessage(`{}`), run); !result.IsError || calls != 2 {
 		t.Fatal("expired owner executed")
 	}
 }

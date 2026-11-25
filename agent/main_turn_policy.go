@@ -15,7 +15,7 @@ import (
 type MainTurnWriteFunc func(context.Context, string, json.RawMessage, func() (actool.Result, error)) (actool.Result, error)
 
 type MainTurnPolicy struct {
-	Mode         string // readonly, control, main_oneoff; unknown modes fail closed
+	Mode         string // readonly, control, work_request, main_oneoff; unknown modes fail closed
 	ControlTools []string
 	Execute      MainTurnWriteFunc
 }
@@ -37,7 +37,7 @@ func mainAdministrativeTool(name string) bool {
 
 func mainReadTool(name string) bool {
 	switch name {
-	case "graph_overview", "list_findings", "list_facts", "node_detail", "expand_digest", "get_worker_output", "get_worker_trace", "search_all_worker_traces", "list_assets", "list_untested_assets", "list_hints", "get_main_conversation", "list_artifacts", "get_instruction_status":
+	case "graph_overview", "list_findings", "list_facts", "node_detail", "expand_digest", "get_worker_output", "get_worker_trace", "search_all_worker_traces", "list_assets", "list_untested_assets", "list_hints", "get_main_conversation", "list_artifacts", "get_instruction_status", "list_work_requests":
 		return true
 	}
 	return false
@@ -63,7 +63,7 @@ func enforceMainTurnPolicy(ctx context.Context, opts *agentcore.Options) {
 	if !tagged {
 		allowed := make([]actool.CoreTool, 0, len(opts.Tools))
 		for _, tool := range opts.Tools {
-			if !mainLifecycleToolName(tool.Name()) {
+			if !mainLifecycleToolName(tool.Name()) && !workRequestAuxTool(tool.Name()) {
 				allowed = append(allowed, tool)
 			}
 		}
@@ -71,6 +71,7 @@ func enforceMainTurnPolicy(ctx context.Context, opts *agentcore.Options) {
 		return
 	}
 	controls := map[string]bool{}
+	_, workRequestsBound := ctx.Value(workRequestsKey{}).(workRequestsContext)
 	for _, name := range policy.ControlTools {
 		if mainAdministrativeTool(name) {
 			controls[name] = true
@@ -85,7 +86,8 @@ func enforceMainTurnPolicy(ctx context.Context, opts *agentcore.Options) {
 		if policy.Execute == nil {
 			continue
 		}
-		if (policy.Mode == "control" && controls[tool.Name()]) || (policy.Mode == "main_oneoff" && tool.Name() == "add_intent") {
+		workRequestWrite := tool.Name() == "set_goals" || tool.Name() == "add_intent" || workRequestAuxTool(tool.Name())
+		if (policy.Mode == "work_request" && workRequestsBound && workRequestWrite) || (policy.Mode == "control" && (controls[tool.Name()] || (controls["set_goals"] && workRequestAuxTool(tool.Name())))) || (policy.Mode == "main_oneoff" && tool.Name() == "add_intent") {
 			allowed = append(allowed, guardPanic(mainFencedTool{CoreTool: tool, execute: policy.Execute}))
 		}
 	}
@@ -98,6 +100,8 @@ func mainTurnPolicyReminder(ctx context.Context) string {
 		return ""
 	}
 	switch policy.Mode {
+	case "work_request":
+		return "\n[Current message routing] Main owns preparation of this durable work request. Use set_goals for the requested verifiable acceptance criteria and add_intent for concrete execution steps, even when this task already has open goals. Reuse matching linked work; attach existing nodes instead of duplicating them. The server attaches new nodes to this request and hands the SAME request and IDs to Planner after Main finishes. Planner owns follow-through and corrections. Inspect observed evidence before resolving a request; never claim completion from dispatch or a worker return alone. Every write remains subject to the server's ownership, lifecycle and request-revision checks."
 	case "control":
 		return "\n[Current message routing] This turn is an explicit administrative request. Only the listed current administrative tools may change state, subject to the server's ownership/lifecycle check. Do not dispatch worker work or infer a new instruction from conversation context."
 	case "main_oneoff":

@@ -509,6 +509,7 @@ function TaskDetailInner() {
             controlPending={controlPending}
             controlBlockedReason={controlNotice?.taskId === id ? controlNotice.reason : undefined}
             onTaskControl={controlTask}
+            onOpenGraph={() => setTab("graph")}
           />
         </TabsContent>
         <TabsContent value="overview" className="mt-0">

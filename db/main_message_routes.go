@@ -408,11 +408,25 @@ func (s *ExplorationStore) FinishMainRouting(ctx context.Context, id int64, toke
 	if d.Owner != "" {
 		delivery = "queued"
 	}
-	m, err := scanMainMessage(s.db.QueryRowContext(ctx, `UPDATE main_message_routes SET routing_status='routed',routing_token='',routing_until=NULL,route=$4,summary=$5,clarification=$6,decision_data=$7,delivery_owner=$8,delivery_status=$9,last_error='',updated_at=now() WHERE exploration_id=$1 AND id=$2 AND routing_status='running' AND routing_token=$3 AND routing_until>now() AND (mode<>'context' OR $4='context') RETURNING `+mainMessageCols, s.expID, id, token, d.Route, d.Summary, d.Clarification, string(d.DecisionData), d.Owner, delivery))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err = s.lockMainParent(ctx, tx); err != nil {
+		return nil, err
+	}
+	m, err := scanMainMessage(tx.QueryRowContext(ctx, `UPDATE main_message_routes SET routing_status='routed',routing_token='',routing_until=NULL,route=$4,summary=$5,clarification=$6,decision_data=$7,delivery_owner=$8,delivery_status=$9,last_error='',updated_at=now() WHERE exploration_id=$1 AND id=$2 AND routing_status='running' AND routing_token=$3 AND routing_until>now() AND (mode<>'context' OR $4='context') RETURNING `+mainMessageCols, s.expID, id, token, d.Route, d.Summary, d.Clarification, string(d.DecisionData), d.Owner, delivery))
 	if err == nil && m == nil {
 		err = ErrMainMessageClaimLost
 	}
-	return m, err
+	if err != nil {
+		return m, err
+	}
+	if err = s.createRoutedWorkRequest(ctx, tx, m, d); err != nil {
+		return nil, err
+	}
+	return m, tx.Commit()
 }
 
 func mainClaimResult(result sql.Result, err error) error {
@@ -524,7 +538,7 @@ func (s *ExplorationStore) ClaimPlannerMessages(ctx context.Context, limit int) 
 		return nil, tx.Commit()
 	}
 	batch := &MainPlannerBatch{Token: uuid.NewString(), Messages: []MainMessage{}}
-	rows, err := tx.QueryContext(ctx, `UPDATE main_message_routes SET delivery_status='inflight',delivery_token=$2,delivery_until=now()+$3*INTERVAL '1 second',updated_at=now() WHERE id IN (SELECT id FROM main_message_routes WHERE exploration_id=$1 AND delivery_owner='planner' AND delivery_status='queued' ORDER BY id LIMIT $4 FOR UPDATE) RETURNING `+mainMessageCols, s.expID, batch.Token, MainDeliveryLease.Seconds(), mainPageLimit(limit))
+	rows, err := tx.QueryContext(ctx, `UPDATE main_message_routes SET delivery_status='inflight',delivery_token=$2,delivery_until=now()+$3*INTERVAL '1 second',updated_at=now() WHERE id IN (SELECT id FROM main_message_routes m WHERE exploration_id=$1 AND delivery_owner='planner' AND (delivery_status='queued' OR (delivery_status='presented' AND EXISTS(SELECT 1 FROM work_requests w WHERE w.id=m.id AND w.state='active'))) ORDER BY (delivery_status='queued') DESC,id LIMIT $4 FOR UPDATE) RETURNING `+mainMessageCols, s.expID, batch.Token, MainDeliveryLease.Seconds(), mainPageLimit(limit))
 	if err != nil {
 		return nil, err
 	}
@@ -544,17 +558,19 @@ func (s *ExplorationStore) ClaimPlannerMessages(ctx context.Context, limit int) 
 	if len(batch.Messages) == 0 {
 		return nil, tx.Commit()
 	}
+	ids := make([]int64, 0, len(batch.Messages))
+	for _, m := range batch.Messages {
+		ids = append(ids, m.ID)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE work_requests SET review_requested=false,updated_at=now() WHERE id=ANY($1::bigint[])`, ids); err != nil {
+		return nil, err
+	}
 	sort.Slice(batch.Messages, func(i, j int) bool { return batch.Messages[i].ID < batch.Messages[j].ID })
 	return batch, tx.Commit()
 }
 
 func (s *ExplorationStore) FinishPlannerMessages(ctx context.Context, token string, success bool) error {
-	state, reason := "presented", ""
-	if !success {
-		state, reason = "needs_review", "Planner delivery was interrupted; review existing effects before retrying"
-	}
-	res, err := s.db.ExecContext(ctx, `UPDATE main_message_routes SET delivery_status=$3,delivery_token='',delivery_until=NULL,last_error=$4,updated_at=now() WHERE exploration_id=$1 AND delivery_owner='planner' AND delivery_status='inflight' AND delivery_token=$2 AND delivery_until>now()`, s.expID, token, state, reason)
-	return mainClaimResult(res, err)
+	return s.finishPlannerWorkRequests(ctx, token, success)
 }
 
 func (s *ExplorationStore) ClaimMainDelivery(ctx context.Context, id int64) (*MainMessage, error) {
@@ -612,6 +628,12 @@ func (s *ExplorationStore) RecoverMainRouting(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err = s.lockMainParent(ctx, tx); err != nil {
+		return err
+	}
+	if err = s.blockInterruptedWorkRequests(ctx, tx); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE main_message_routes SET routing_status=CASE WHEN attempts<$2 THEN 'pending' ELSE 'failed' END,routing_token='',routing_until=NULL,retry_after=now(),last_error='Routing lease expired before a decision was committed',updated_at=now() WHERE exploration_id=$1 AND routing_status='running' AND routing_until<=now()`, s.expID, MainRoutingMaxAttempts); err != nil {
 		return err
 	}

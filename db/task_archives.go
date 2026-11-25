@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	TaskArchiveFormatVersion       = 3
+	// Version 4 preserves durable work requests and their graph links. Older
+	// readers must reject it rather than restore a task without its obligations.
+	TaskArchiveFormatVersion       = 4
 	TaskArchiveLegacyFormatVersion = 1
 	TaskArchiveLLMRecordsPath      = "database/llm_records.ndjson"
 )
@@ -624,6 +626,8 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		{"side_question_sessions", `SELECT * FROM side_question_sessions WHERE task_id=$1 ORDER BY session_key`, []any{taskID}},
 		{"side_question_requests", `SELECT r.* FROM side_question_requests r JOIN side_question_sessions s ON s.session_key=r.session_key WHERE s.task_id=$1 ORDER BY r.ordinal`, []any{taskID}},
 		{"main_message_routes", `SELECT * FROM main_message_routes WHERE exploration_id=$1 ORDER BY id`, []any{expID}},
+		{"work_requests", `SELECT * FROM work_requests WHERE exploration_id=$1 ORDER BY id`, []any{expID}},
+		{"work_request_nodes", `SELECT link.* FROM work_request_nodes link JOIN work_requests request ON request.id=link.request_id WHERE request.exploration_id=$1 ORDER BY link.request_id,link.kind,link.slot_key`, []any{expID}},
 		{"assets", `SELECT asset.* FROM assets asset WHERE asset.id IN (` + archiveAssetIDsQuery() + `) ORDER BY asset.id`, []any{taskID, expID}},
 	}
 	counts := make(map[string]int64, len(queries))

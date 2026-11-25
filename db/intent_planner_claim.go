@@ -33,8 +33,9 @@ func (s *ExplorationStore) ClaimIntentTokenAfterPlannerReview(ctx context.Contex
 SET state='running', owner=$1, unclaim_token=$4, last_heartbeat_at=now()
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'
 AND NOT EXISTS (SELECT 1 FROM main_message_routes
-    WHERE exploration_id=$3 AND delivery_owner='planner'
-      AND delivery_status IN ('queued','inflight'))`, owner, id, s.expID, token)
+    WHERE exploration_id=$3 AND delivery_status IN ('queued','inflight')
+      AND (delivery_owner='planner' OR (delivery_owner='main' AND EXISTS
+        (SELECT 1 FROM work_requests w WHERE w.id=main_message_routes.id))))`, owner, id, s.expID, token)
 	if err != nil {
 		return "", err
 	}

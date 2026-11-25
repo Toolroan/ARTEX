@@ -187,11 +187,12 @@ func TestTerminalTaskQueuedByAdmissionKeepsExecutionBarrier(t *testing.T) {
 		_, _ = m.DeleteTask(holder.ID, DeleteTaskOptions{})
 		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
 	}()
-	intentID, err := task.Store.AddIntent(map[string]any{"summary": "follow-up"}, 10, nil, "human")
-	if err != nil {
+	if err := m.SetTaskStatus(task.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.SetTaskStatus(task.ID, "done"); err != nil {
+	// A new operator follow-up arrives after the prior run completed.
+	intentID, err := task.Store.AddIntent(map[string]any{"summary": "follow-up"}, 10, nil, "human")
+	if err != nil {
 		t.Fatal(err)
 	}
 

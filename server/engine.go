@@ -1068,6 +1068,12 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if queueErr != nil {
 			return false
 		} // never lose a pending instruction on a failed read
+		if !queuedInstructions {
+			waiting, err := t.Store.WorkRequestsAwaitingInput(ctx)
+			if err != nil || waiting {
+				return false // visible blocked requests wait for an explicit review wake
+			}
+		}
 		instructionOnly := false
 		// Goalless tasks only plan when an explicit typed instruction is queued.
 		// Instruction-only mode cannot judge completion or invent autonomous work,
@@ -1127,6 +1133,16 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		pctx := e.budgetRoundCtx(e.plannerGateContext(ectx, t, intercept.DefaultTargetWaitBound), t, false)
 		pctx = plannerInboxContext(pctx, t, batch)
+		var requestErr error
+		var requestMessages []db.MainMessage
+		if batch != nil {
+			requestMessages = batch.Messages
+		}
+		pctx, requestErr = bindWorkRequests(pctx, t, requestMessages)
+		if requestErr != nil {
+			e.emitActivity(t, db.Activity{Worker: "planner", Kind: "text", IsError: true, Summary: "Request ownership could not be loaded; work remains saved for review."})
+			return false
+		}
 		if batch != nil {
 			pctx = agent.WithPlannerDeliveryFence(pctx, func(checkCtx context.Context) error {
 				check, stop := context.WithTimeout(checkCtx, 5*time.Second)
@@ -1172,14 +1188,15 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			log.Printf("[planner] task %s planning error: %v", t.ID, err)
 		case met:
 			log.Printf("[planner] task %s judged all goals met: %s", t.ID, reason)
-			// All goals met → persist the task state as done (the frontend DTO shows this terminal state first).
-			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
+			// A model's goal judgment proposes success. The durable task/request
+			// transaction decides whether completion is safe, including new requests
+			// accepted concurrently with this round. Refusal must not stop workers.
+			if won, err := e.m.SetTaskStatusGuarded(t.ID, "done", ""); err != nil {
 				log.Printf("[planner] task %s failed to persist completion: %v", t.ID, err)
+			} else if won {
+				e.cancelExec(t.ID, agent.AbortGoalMet)
 			}
-			// Task judged complete → cancel the running workers at once: whatever their
-			// in-flight intents produce no longer matters. The next worker-loop pass claims
-			// nothing new at the terminal gate; the cancelled ones take the "task completed" branch below and end up stopped (not blocked).
-			e.cancelExec(t.ID, agent.AbortGoalMet)
+
 		default:
 			log.Printf("[planner] task %s planning finished", t.ID)
 		}

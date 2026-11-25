@@ -40,6 +40,7 @@ import type {
 } from "../types";
 import { artifactFixtures, artifactPreviewFixtures } from "./artifact-fixtures";
 import { applyMockTaskControl, mockReceiptForTask } from "./task-continuation";
+import { fixtureWorkRequests, reviewFixtureWorkRequest } from "./work-request-fixtures";
 import * as D from "./data";
 
 const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
@@ -74,6 +75,11 @@ const mockTasks: Task[] = structuredClone([
     engine_mode: "idle",
   },
 ]);
+const mockWorkRequests: Record<string, ReturnType<typeof fixtureWorkRequests>> = {
+  "t-acme-web": fixtureWorkRequests("t-acme-web"),
+  "t-timeout-fixture": fixtureWorkRequests("t-timeout-fixture"),
+  "t-failed-fixture": fixtureWorkRequests("t-failed-fixture"),
+};
 const mockCollectedArtifacts: Record<string, CollectedArtifact[]> = { "t-acme-web": structuredClone(artifactFixtures) };
 const mockArtifactPreviews: Record<string, Record<string, CollectedArtifactPreview>> = {
   "t-acme-web": structuredClone(artifactPreviewFixtures),
@@ -108,7 +114,7 @@ const mockMessageRoutes: {
     receipt: {
       message_id: 10002,
       route: "correction",
-      delivery: "queued",
+      delivery: "presented",
       text: "Synthetic correction: keep the existing scope",
     },
   },
@@ -1661,6 +1667,20 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
           ),
         )
         .sort((a, b) => b.message_id - a.message_id),
+    };
+  }
+  if (seg[0] === "tasks" && seg[2] === "work-requests" && m === "GET") {
+    return { requests: mockWorkRequests[seg[1]] ?? [] };
+  }
+  if (seg[0] === "tasks" && seg[2] === "work-requests" && seg[4] === "review" && m === "POST") {
+    reviewFixtureWorkRequest(mockWorkRequests[seg[1]] ?? [], Number(seg[3]));
+    const task = mockTasks.find((item) => item.id === seg[1]);
+    const stopped = task && ["timeout", "done", "failed", "paused", "queued"].includes(task.status);
+    return {
+      queued: true,
+      ...(stopped
+        ? { waiting_reason: "Synthetic task is stopped or queued; review remains saved until the task can run." }
+        : {}),
     };
   }
   if (seg[0] === "tasks" && seg[2] === "main-message-routes" && seg[4] === "retry" && m === "POST") {

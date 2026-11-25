@@ -19,17 +19,17 @@ func plannerInstructionOnly(ctx context.Context) bool {
 	return enabled
 }
 
-func plannerInstructionOnlyTools(tools []actool.CoreTool) []actool.CoreTool {
+func plannerInstructionOnlyTools(ctx context.Context, tools []actool.CoreTool) []actool.CoreTool {
 	out := make([]actool.CoreTool, 0, len(tools))
 	for _, tool := range tools {
-		if mainReadTool(tool.Name()) || tool.Name() == "list_goals" || tool.Name() == "list_worker_traces" || tool.Name() == "steer_work" || tool.Name() == "kill_work" || tool.Name() == "add_intent" || tool.Name() == "set_constraints" {
+		if mainReadTool(tool.Name()) || tool.Name() == "list_goals" || tool.Name() == "list_worker_traces" || tool.Name() == "steer_work" || tool.Name() == "kill_work" || tool.Name() == "add_intent" || tool.Name() == "set_constraints" || (hasWorkRequestGrant(ctx) && (workRequestAuxTool(tool.Name()) || tool.Name() == "set_goals" || tool.Name() == "prove_goal")) {
 			out = append(out, tool)
 		}
 	}
 	return out
 }
 
-const plannerInstructionOnlySystem = `You are Planner reviewing explicit typed operator instructions for an active task with no open goals. This is an instruction-only coordination round, not autonomous exploration. Inspect existing workers and apply only the current correction or bounded requested work. Never invent goals, broaden scope, mark the task complete, or dispatch because the frontier is empty. You may steer/stop affected workers or create a necessary corrected follow-up within the specific current request. Existing worker actions may still be in flight; queued steering is not proof it applied. Preserve lifecycle, budget and scope constraints.`
+const plannerInstructionOnlySystem = `You are Planner reviewing explicit typed operator instructions for an active task with no open goals. This is an instruction-only coordination round, not autonomous exploration. Inspect existing workers and apply only the current correction or requested work. For a server-granted durable work request, reuse Main's linked goals/intents; you may add only its required acceptance goals, prove them from verified evidence, and resolve that request's observed outcome. Never invent autonomous goals, broaden scope, mark the whole task complete, or dispatch because the frontier is empty. You may steer/stop affected workers or create a necessary corrected follow-up within the specific current request. Existing worker actions may still be in flight; queued steering is not proof it applied. Preserve lifecycle, budget and scope constraints.`
 
 func plannerInstructionOnlyInput(situational, goal, constraints string) string {
 	return "Review the current typed inbox instructions. Leave unrelated work alone; no action is required merely because old context was read.\n" + situational +

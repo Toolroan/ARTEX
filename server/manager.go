@@ -1595,7 +1595,13 @@ func (m *Manager) SetTaskStatusGuarded(id, status, endReason string) (won bool, 
 	if err != nil {
 		return false, err
 	}
-	won, err = m.pg.SetTerminalStatusGuarded(n, status, endReason)
+	if status == "done" {
+		check, stop := context.WithTimeout(context.Background(), 10*time.Second)
+		won, err = m.pg.TryCompleteTask(check, n)
+		stop()
+	} else {
+		won, err = m.pg.SetTerminalStatusGuarded(n, status, endReason)
+	}
 	if err != nil || !won {
 		return won, err
 	}
@@ -1616,6 +1622,16 @@ func (m *Manager) SetTaskStatusGuarded(id, status, endReason string) (won bool, 
 // SetTaskStatus persists a task's lifecycle status (e.g. "done") and reflects it
 // on the in-memory handle so the derived DTO status shows it without a reload.
 func (m *Manager) SetTaskStatus(id, status string) error {
+	if status == "done" {
+		won, err := m.SetTaskStatusGuarded(id, status, "")
+		if err != nil {
+			return err
+		}
+		if !won {
+			return fmt.Errorf("task completion was not admitted: unresolved work or lifecycle state changed")
+		}
+		return nil
+	}
 	m.taskStateMu.Lock()
 	defer m.taskStateMu.Unlock()
 	n, err := strconv.ParseInt(id, 10, 64)
@@ -1986,6 +2002,14 @@ func (t *Task) Notify() {
 // (debounce) until the round drains them via drainTriggers.
 func (t *Task) NotifyDone(intentID int64) {
 	if intentID > 0 {
+		if t.Store != nil {
+			ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+			err := t.Store.MarkIntentRequestsForReview(ctx, intentID)
+			stop()
+			if err != nil {
+				log.Printf("[work-request] task %s outcome review could not be queued: %v", t.ID, err)
+			}
+		}
 		t.trigMu.Lock()
 		t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "done", IntentID: intentID})
 		t.trigMu.Unlock()

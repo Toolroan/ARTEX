@@ -45,9 +45,14 @@ type ToolSeed struct {
 // identical to before. Only artex's own domain tools enter the table as manageable.
 func builtinToolsByAgent() map[string][]actool.CoreTool {
 	ts := NewToolSet(nil, "")
+	mainTools := append(ts.MainAgentTools(), ts.workRequestTools()...)
+	plannerTools := append(ts.PlannerTools(), ts.workRequestTools()...)
+	// Runtime Planner exposes set_goals only with a server-granted request;
+	// catalog binding alone never grants that administrative capability.
+	plannerTools = append(plannerTools, ts.setGoals())
 	return map[string][]actool.CoreTool{
-		"mainagent": ts.MainAgentTools(),
-		"planner":   ts.PlannerTools(),
+		"mainagent": mainTools,
+		"planner":   plannerTools,
 		"worker":    ts.WorkerTools(),
 		// goals (the goal decomposer) binds set_goals + set_constraints by default: it
 		// uses them to write the decomposed goals and extracted operation constraints

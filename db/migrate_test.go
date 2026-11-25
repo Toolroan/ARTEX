@@ -123,7 +123,7 @@ func readApplied(t *testing.T, d *DB) []appliedMigration {
 // embedded migration is recorded with the SHA-256 of its file.
 func assertEmbeddedApplied(t *testing.T, d *DB) []appliedMigration {
 	t.Helper()
-	for _, table := range []string{"llm_records", "llm_usage", "llm_context", "traffic_tamper_hooks", "traffic_tamper_hook_versions", "main_message_routes"} {
+	for _, table := range []string{"llm_records", "llm_usage", "llm_context", "traffic_tamper_hooks", "traffic_tamper_hook_versions", "main_message_routes", "work_requests", "work_request_nodes"} {
 		var exists bool
 		if err := d.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
 			t.Fatal(err)
@@ -139,7 +139,7 @@ func assertEmbeddedApplied(t *testing.T, d *DB) []appliedMigration {
 	}{{1, llmRecordsMigration}, {2, llmUsageMigration}, {3, "0003_task_scope_icp_index.sql"}, {4, "0004_llm_usage_ts_index.sql"},
 		{5, "0005_traffic_rewrite_rules.sql"}, {6, "0006_activity_outbox.sql"}, {7, "0007_finding_report_state.sql"},
 		{8, "0008_traffic_evidence_rewrite_flag.sql"}, {9, "0009_llm_context.sql"}, {10, "0010_dashboard_usage_indexes.sql"},
-		{11, "0011_traffic_tamper_hooks.sql"}, {12, "0012_lesson_withdrawn.sql"}, {13, "0013_main_message_routes.sql"}}
+		{11, "0011_traffic_tamper_hooks.sql"}, {12, "0012_lesson_withdrawn.sql"}, {13, "0013_main_message_routes.sql"}, {14, "0014_work_requests.sql"}}
 	if len(applied) != len(want) {
 		t.Fatalf("schema_migrations = %+v, want versions 1 to %d", applied, len(want))
 	}

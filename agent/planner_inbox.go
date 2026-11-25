@@ -37,7 +37,7 @@ func WithPlannerInbox(ctx context.Context, instructions []PlannerInstruction, co
 func renderPlannerInbox(ctx context.Context, env dataEnvelope) string {
 	batch, ok := ctx.Value(plannerInboxKey{}).(plannerInboxInput)
 	if !ok {
-		return ""
+		return workRequestReminder(ctx)
 	}
 	var out strings.Builder
 	if len(batch.Conversation) > 0 {
@@ -58,5 +58,6 @@ func renderPlannerInbox(ctx context.Context, env dataEnvelope) string {
 	if len(batch.Instructions) > 0 {
 		out.WriteString("\nReview each current instruction against existing work and observed outcomes before acting. Delivery can repeat after a crash: reuse existing matching work and do not repeat a completed correction or dispatch. Report the instruction IDs considered and actual intent IDs affected, or explain no change/clarification. A reviewed instruction is not proof that worker changes have executed.")
 	}
+	out.WriteString(workRequestReminder(ctx))
 	return out.String()
 }

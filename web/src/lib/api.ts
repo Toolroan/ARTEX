@@ -6,6 +6,7 @@
 import { t } from "@/i18n";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
+import type { WorkRequest } from "@/lib/work-requests";
 
 export type PlannerDelivery = {
   hint_id?: number; // historical receipt compatibility
@@ -452,6 +453,9 @@ export const api = {
     post<PlannerDelivery>(`/tasks/${taskId}/planner-instructions`, { text, request_id: requestId, seg }),
   mainMessageRoutes: (taskId: string, seg: number) =>
     get<{ items: PlannerDelivery[] }>(`/tasks/${taskId}/main-message-routes?seg=${seg}`),
+  workRequests: (taskId: string) => get<{ requests: WorkRequest[] }>(`/tasks/${taskId}/work-requests`),
+  reviewWorkRequest: (taskId: string, requestId: number) =>
+    post<{ queued: boolean; waiting_reason?: string }>(`/tasks/${taskId}/work-requests/${requestId}/review`, {}),
   retryMainMessageRoute: (taskId: string, messageId: number) =>
     post<PlannerDelivery>(`/tasks/${taskId}/main-message-routes/${messageId}/retry`),
   taskLLMResolution: (id: string) => get<TaskLLMResolutions>(`/tasks/${id}/llm/resolution`),

@@ -584,7 +584,7 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
 }
 
 func (s *ExplorationStore) ReopenIntentsByBlockedReason(reason string) (int64, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes
+	res, err := s.execObligationMutation(`UPDATE exploration_nodes
 SET state='open', blocked_reason=NULL, completed_at=NULL
 WHERE exploration_id=$1 AND kind='intent' AND state='blocked' AND blocked_reason=$2`, s.expID, reason)
 	if err != nil {

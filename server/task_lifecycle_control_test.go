@@ -77,7 +77,7 @@ func lifecycleControlFixture(t *testing.T, timeout int) (*Server, *Task) {
 	return newAdmissionTestServer(m, nil), task
 }
 
-func TestExplicitRestartReviewsGoallessPendingInboxOnce(t *testing.T) {
+func TestExplicitRestartReviewsGoallessPendingInboxWithoutImplicitSuccess(t *testing.T) {
 	s, task := lifecycleControlFixture(t, 120)
 	if _, err := s.m.StampTaskFirstRun(task.ID); err != nil {
 		t.Fatal(err)
@@ -140,27 +140,28 @@ func TestExplicitRestartReviewsGoallessPendingInboxOnce(t *testing.T) {
 	}
 	close(p.release)
 	deadline := time.Now().Add(3 * time.Second)
-	for task.lifecycleSnapshot().Status != "done" && time.Now().Before(deadline) {
+	var stored *db.MainMessage
+	var request *db.WorkRequest
+	for time.Now().Before(deadline) {
+		stored, err = task.Store.GetMainMessage(t.Context(), msg.ID)
+		request, _ = task.Store.GetWorkRequest(t.Context(), msg.ID)
+		if err == nil && stored.DeliveryStatus == "presented" && request != nil && request.State == "blocked" {
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	stored, err := task.Store.GetMainMessage(t.Context(), msg.ID)
-	if err != nil || stored.DeliveryStatus != "presented" || task.lifecycleSnapshot().Status != "done" || p.calls.Load() != 1 || !p.instruction.Load() {
-		t.Fatalf("inbox not reviewed once then settled: delivery=%+v state=%+v calls=%d instruction=%t err=%v", stored, task.lifecycleSnapshot(), p.calls.Load(), p.instruction.Load(), err)
+	if err != nil || stored.DeliveryStatus != "presented" || request == nil || request.State != "blocked" || task.lifecycleSnapshot().Status != "running" || p.calls.Load() != 1 || !p.instruction.Load() {
+		t.Fatalf("delivery must not imply outcome completion: delivery=%+v request=%+v state=%+v calls=%d instruction=%t err=%v", stored, request, task.lifecycleSnapshot(), p.calls.Load(), p.instruction.Load(), err)
 	}
 	if intents, err := task.Store.ListByKind(db.KindIntent, 10); err != nil || len(intents) != 0 {
 		t.Fatalf("restart created work without a request: %v %v", intents, err)
 	}
-	// Even a late repeated request after this short run has already settled
-	// cannot replay the durable inbox or cause an autonomous goalless LLM call.
-	if _, err := s.applyTaskControl(task, "restart"); err != nil {
-		t.Fatal(err)
-	}
-	deadline = time.Now().Add(time.Second)
-	for task.lifecycleSnapshot().Status != "done" && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if p.calls.Load() != 1 || task.lifecycleSnapshot().Status != "done" {
-		t.Fatal("late repeated restart replayed a reviewed instruction")
+	// An ordinary notification does not repeat a blocked request indefinitely.
+	// The explicit Review request / wake controls can ask for another review.
+	task.Notify()
+	time.Sleep(50 * time.Millisecond)
+	if p.calls.Load() != 1 || task.lifecycleSnapshot().Status != "running" {
+		t.Fatal("ordinary notification replayed a blocked request or completed it")
 	}
 }
 
@@ -273,9 +274,12 @@ func TestExplicitRestartClearsPriorPauseOnlyAfterTaskEnded(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.engine.Pause(task.ID, agent.AbortPausedByUser)
-			if err := s.m.SetTaskStatus(task.ID, status); err != nil {
+			// Model a pre-existing terminal+paused record. New success transitions
+			// cannot create this combination because the completion guard rejects pause.
+			if err := s.m.pg.SetStatus(mustTaskID(t, task.ID), status); err != nil {
 				t.Fatal(err)
 			}
+			task.updateLifecycle(func(state *taskLifecycleState) { state.Status = status })
 			before := task.lifecycleSnapshot()
 			if !before.Paused || before.Status != status {
 				t.Fatalf("fixture lacks terminal/pause combination: %+v", before)

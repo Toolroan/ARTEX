@@ -80,6 +80,7 @@ import type {
   TokenTotal,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { RequestedWork } from "./requested-work";
 
 // resolutionLabel names the LLM a session runs on. The badge shows this alone and
 // keeps the model id in its tooltip. Env-backed configs can arrive without a name,
@@ -516,6 +517,7 @@ export function SessionsTab({
   controlPending = false,
   controlBlockedReason,
   onTaskControl,
+  onOpenGraph,
 }: {
   taskId: string;
   taskPaused?: boolean;
@@ -524,6 +526,7 @@ export function SessionsTab({
   controlPending?: boolean;
   controlBlockedReason?: string;
   onTaskControl?: (action: TaskControlAction) => Promise<void>;
+  onOpenGraph?: () => void;
 }) {
   const approvalFocus = useApprovalFocus({ taskId });
   const [selectedSessionId, setActiveId] = React.useState(MAIN_ID);
@@ -1858,6 +1861,7 @@ export function SessionsTab({
                 </TooltipContent>
               </Tooltip>
             )}
+            <RequestedWork taskId={taskId} onOpenGraph={onOpenGraph} />
           </div>
           <ScrollArea
             id="session-list-panel"

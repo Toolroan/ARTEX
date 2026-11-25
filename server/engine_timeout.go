@@ -273,6 +273,12 @@ func (e *Engine) settleTask(ctx context.Context, t *Task, budget bool) {
 			Summary: "Task run budget exhausted: forced wrap-up done, task stopped (final state " + status + ")"})
 	}
 	won, err := e.m.SetTaskStatusGuarded(t.ID, status, endReason)
+	if err == nil && !won && status == "done" {
+		// Resource exhaustion ends this run even when unresolved requests reject
+		// success. Their outcomes remain unresolved for an explicit continuation.
+		status = "timeout"
+		won, err = e.m.SetTaskStatusGuarded(t.ID, status, endReason)
+	}
 	switch {
 	case err != nil:
 		log.Printf("[deadline] task %s failed to settle the terminal state: %v", t.ID, err)

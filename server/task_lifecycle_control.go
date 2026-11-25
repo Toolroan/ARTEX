@@ -1,6 +1,10 @@
 package server
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
 // applyTaskLifecycleControl serves explicit operator wake/restart requests.
 // Ordinary chat routing never calls it. The locked form also serves Main's
@@ -68,6 +72,9 @@ func (s *Server) applyTaskLifecycleControlLocked(t *Task, action string) (taskCo
 		case s.engine.budgetBlocksClaim(t.ID):
 			return blocked("Task budget does not allow further worker dispatch; waking Planner does not reset recorded spend.")
 		}
+		if err := queueRequestedWorkReview(t); err != nil {
+			return blocked("Saved work could not be queued for review; no wake was sent.")
+		}
 		// Notify cannot bypass the Planner's lifecycle/budget gates or create an
 		// intent. This is a wake signal, not proof that an inbox item was reviewed.
 		t.Notify()
@@ -86,7 +93,16 @@ func (s *Server) applyTaskLifecycleControlLocked(t *Task, action string) (taskCo
 		} else if s.engine.budgetBlocksClaim(t.ID) {
 			out.BlockedReason = "Task budget does not allow further worker dispatch; continuing does not reset recorded spend."
 		}
+		if out.BlockedReason == "" && !state.Queued {
+			if err := queueRequestedWorkReview(t); err != nil {
+				return blocked("Saved work could not be queued for review.")
+			}
+			t.Notify()
+		}
 		return out, nil
+	}
+	if err := queueRequestedWorkReview(t); err != nil {
+		return blocked("Saved work could not be queued for review; continuation was not started.")
 	}
 	queued, err := s.admitTaskWhenLocked(t, "resume", false)
 	if err != nil {
@@ -103,4 +119,13 @@ func (s *Server) applyTaskLifecycleControlLocked(t *Task, action string) (taskCo
 		out.BlockedReason = "Task budget does not allow further worker dispatch; continuing does not reset recorded spend."
 	}
 	return out, nil
+}
+
+// Only explicit wake/continue controls reopen a blocked tracked request. They
+// cannot adopt old delivered messages or replay an uncertain expired lease.
+func queueRequestedWorkReview(t *Task) error {
+	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	_, err := t.Store.QueueWorkRequestReviews(ctx)
+	return err
 }

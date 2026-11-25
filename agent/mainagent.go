@@ -88,8 +88,8 @@ const mainAgentDefaultTmpl = `You are the "main agent" of an authorized penetrat
 1. Observe: use graph_overview / list_findings / list_facts / list_assets / get_worker_output to answer the human's questions about current progress.
 2. Steer (land the human's intent into the system):
    - The server saves conversation context and classifies each new message. Follow the actual receipt: questions stay context, ambiguity needs clarification, and actionable instructions/corrections are durably routed. Context saved is not proof of Planner notification.
-   - Planner owns routed worker work and corrections. Main has no steer_work capability and must not duplicate dispatch or add the same instruction as a hint.
-   - Only when the server assigns this turn to main_oneoff and exposes add_intent may you dispatch its requested bounded check. Include full file paths and expected result; check existing work first. Do not invent a formal goal or new targets.
+   - Main first prepares a server-assigned work_request: set_goals records its requested acceptance criteria and add_intent records concrete execution steps. Both create nodes linked to that durable request, even if other open goals exist. Planner then follows through on the SAME request and node IDs. Corrections already owned by Planner stay there; never create a duplicate request or hint.
+   - For legacy main_oneoff turns, use the exposed add_intent for its requested bounded check. Include full file paths and expected result; check existing work first. Do not invent a formal goal or new targets.
    - Only when the server assigns a control turn may you use its exposed goals/constraints/scope tools for the explicit administrative request. All writes remain subject to the current lifecycle and ownership fence. Never treat an assistant proposal as authorization without the current operator's resolved approval.
 3. Reply concisely in plain language, stating what you did.
 
@@ -132,6 +132,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		trusted = append(trusted, tool)
 	}
 	trusted = append(trusted, mainLifecycleTools(ctx)...)
+	trusted = append(trusted, tsx.workRequestTools()...)
 	tools := append(trusted[:0:0], trusted...)
 	if resolve := ToolResolve(); resolve != nil {
 		tools = resolve(ctx, "mainagent", tools)
@@ -143,7 +144,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		Provider:     m.prov,
 		SystemPrompt: []string{mainAgentSystem(goal, m.workDir, mainDir)},
 		SystemReminderFunc: func() string {
-			return mainAgentTurnReminder(mainDir) + mainTurnPolicyReminder(ctx)
+			return mainAgentTurnReminder(mainDir) + mainTurnPolicyReminder(ctx) + workRequestReminder(ctx)
 		},
 		Tools:          tools,
 		PermissionMode: permission.ModeBypass,

@@ -1398,15 +1398,20 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 
 func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "Generate [exploration directions] into the frontier and link them into the exploration graph. An intent is an open exploration direction, not a fixed type — describe freely in one summary sentence what to explore/verify/exploit.\n"+
-		"★Batch preferred: put multiple new directions filtered in one round into the intents array in a single submission (saves round trips vs. one call per item). Returns an ids array, same length and order as intents (failed items get id=0, details in errors). For a single intent, omit intents and pass the top-level summary.",
+		"★Batch preferred: put multiple new directions filtered in one round into the intents array in a single submission (saves round trips vs. one call per item). Returns an ids array, same length and order as intents (failed items get id=0, details in errors). For a single intent, omit intents and pass the top-level summary. For a durable work request, pass its request_id (required when multiple requests are granted); the entire batch belongs to that request. Existing matching items return their original IDs instead of duplicating work. Reuse linked intent IDs from the request before adding another step.",
 		obj(map[string]any{
+			"request_id": idp("durable request ID granted to this turn; the whole batch belongs to this request; omit only for a single granted request or legacy autonomous work"),
 			"intents":    map[string]any{"type": "array", "description": "[Prefer this] array of exploration directions to add, processed in order. Each element has the same fields as the top-level ones below (summary/asset_ids/parent_ids/priority). The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
 			"summary":    str("[single] one sentence describing this exploration direction: what to do + why. Just write the direction clearly; asset ids are not required."),
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "the [target asset ids] this direction tests/attacks (**pass whenever possible**, 0/1/many; these are asset ids from list_assets, not exploration node ids): which assets (sites/endpoints/parameters/hosts etc.) this direction targets. Whenever the direction revolves around concrete assets, be sure to pass them — it is the structured marker of 'which targets this exploration hits', used for coverage dedup and linking the intent into the asset lineage. Leave empty only for pure global recon with truly no concrete target assets."},
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "upstream anchor ids (optional, 0/1/many): which [confirmed fact/finding] nodes this direction is synthesized from. **Only existing fact/finding node ids may be passed — not intents/goals/hints** — an intent must anchor on confirmed knowledge, finding-driven rather than planned out of thin air. Pass several when multiple facts jointly produce one new intent; leave empty for a top-level brand-new recon direction (it is automatically attached to the task's origin fact)."},
 			"priority":   intp("priority 0-10, default 5"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			grant, grantErr := selectWorkRequest(ctx, in)
+			if grantErr != nil {
+				return actool.Errorf(grantErr.Error()), nil
+			}
 			var a struct {
 				Intents    []intentItem `json:"intents"`
 				intentItem              // single mode: top-level summary/asset_ids/parent_ids/priority
@@ -1419,16 +1424,25 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			}
 
 			ids := make([]int64, len(items))
+			created := make([]bool, len(items))
 			errs := map[string]string{}
 			createdAny := false
 			for i, it := range items {
-				id, err := t.addOneIntent(it)
+				var id int64
+				var err error
+				isNew := true
+				if grant != nil {
+					id, isNew, err = t.addRequestIntent(ctx, *grant, it)
+				} else {
+					id, err = t.addOneIntent(it)
+				}
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
 				}
 				ids[i] = id
-				createdAny = true
+				created[i] = isNew
+				createdAny = createdAny || isNew
 			}
 
 			// A human drops an intent directly via the main agent → if the task is done
@@ -1446,9 +1460,15 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
+				if grant != nil {
+					return jsonResult(map[string]any{"id": ids[0], "request_id": grant.RequestID, "created": created[0]})
+				}
 				return actool.Text(fmt.Sprintf("intent created: %d", ids[0])), nil
 			}
 			out := map[string]any{"ids": ids}
+			if grant != nil {
+				out["request_id"], out["created"] = grant.RequestID, created
+			}
 			if len(errs) > 0 {
 				out["errors"] = errs
 			}
@@ -1911,15 +1931,20 @@ func (t *ToolSet) setGoals() actool.CoreTool {
 	return writeTool("set_goals",
 		"Add exploration goals (goals) to [this task]. A goal = a final deliverable/verifiable result, not an attack step or recon action.\n"+
 			"★Batch preferred: put multiple goals in the goals array in a single submission; the returned ids match it in length and order (failed items get id=0, details in errors). For a single goal, omit goals and pass the top-level text.\n"+
-			"vulnclass is optional: the corresponding vulnerability class (e.g. SQLi/IDOR); leave empty for business-logic goals. Whether a goal is met is judged and marked met by the system; this tool only adds.",
+			"vulnclass is optional: the corresponding vulnerability class (e.g. SQLi/IDOR); leave empty for business-logic goals. Whether a goal is met is judged and marked met by the system; this tool only adds. With a durable work request, create only its requested acceptance criteria and pass request_id when multiple requests are granted; all goals in this call belong to that request. Existing matching goals are reused. Do not use goal IDs as add_intent parent_ids.",
 		obj(map[string]any{
-			"goals":     map[string]any{"type": "array", "description": "[Prefer this] array of goals to add, processed in order. Each element: text (required, an independently verifiable final goal) + vulnclass (optional). The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
-			"text":      str("[single] one independently verifiable final goal"),
-			"vulnclass": str("[single] the corresponding vulnerability class (if clear), e.g. SQLi/IDOR; may be empty for business-logic goals"),
+			"request_id": idp("durable request ID granted to this turn; the whole batch belongs to this request; omit only for a single granted request or legacy goal decomposition"),
+			"goals":      map[string]any{"type": "array", "description": "[Prefer this] array of goals to add, processed in order. Each element: text (required, an independently verifiable final goal) + vulnclass (optional). The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
+			"text":       str("[single] one independently verifiable final goal"),
+			"vulnclass":  str("[single] the corresponding vulnerability class (if clear), e.g. SQLi/IDOR; may be empty for business-logic goals"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.ts == nil {
 				return actool.Errorf("set_goals is not enabled: ExplorationStore is not initialized"), nil
+			}
+			grant, grantErr := selectWorkRequest(ctx, in)
+			if grantErr != nil {
+				return actool.Errorf(grantErr.Error()), nil
 			}
 			var a struct {
 				Goals    []goalItem `json:"goals"`
@@ -1933,16 +1958,27 @@ func (t *ToolSet) setGoals() actool.CoreTool {
 			}
 
 			ids := make([]int64, len(items))
+			created := make([]bool, len(items))
 			errs := map[string]string{}
 			var addedTexts []string
 			for i, it := range items {
-				id, err := t.addOneGoal(it)
+				var id int64
+				var err error
+				isNew := true
+				if grant != nil {
+					id, isNew, err = t.addRequestGoal(ctx, *grant, it)
+				} else {
+					id, err = t.addOneGoal(it)
+				}
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
 				}
 				ids[i] = id
-				addedTexts = append(addedTexts, strings.TrimSpace(it.Text))
+				created[i] = isNew
+				if isNew {
+					addedTexts = append(addedTexts, strings.TrimSpace(it.Text))
+				}
 			}
 			if len(addedTexts) > 0 {
 				// Wake the planner (once for the whole batch). Prefer notifyGoal: one
@@ -1968,9 +2004,15 @@ func (t *ToolSet) setGoals() actool.CoreTool {
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
+				if grant != nil {
+					return jsonResult(map[string]any{"id": ids[0], "request_id": grant.RequestID, "created": created[0]})
+				}
 				return actool.Text(fmt.Sprintf("goal added: %d", ids[0])), nil
 			}
 			out := map[string]any{"ids": ids}
+			if grant != nil {
+				out["request_id"], out["created"] = grant.RequestID, created
+			}
 			if len(errs) > 0 {
 				out["errors"] = errs
 			}

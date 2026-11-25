@@ -159,6 +159,9 @@ func TestTerminalPlannerReceiptsRequireExplicitContinuation(t *testing.T) {
 	for _, status := range []string{"timeout", "failed", "done"} {
 		t.Run(status, func(t *testing.T) {
 			s, task := plannerBridgeFixture(t)
+			if _, err := s.m.pg.Exec(`UPDATE exploration_nodes SET state='met' WHERE exploration_id=$1 AND kind='goal'`, task.ExpID); err != nil {
+				t.Fatal(err)
+			}
 			if err := s.m.SetTaskStatus(task.ID, status); err != nil {
 				t.Fatal(err)
 			}

@@ -225,7 +225,7 @@ func (s *Server) messageReceipt(t *Task, msg *db.MainMessage) mainMessageReceipt
 	case msg.DeliveryStatus == "presented":
 		r.Delivery, r.Reason = "presented", "Reviewed; this is not confirmation that a worker applied it."
 	case msg.DeliveryOwner == "main":
-		r.Delivery, r.Reason = "main", "Main is handling the requested task configuration or bounded one-off."
+		r.Delivery, r.Reason = "main", "Main is recording the requested goals or work before Planner takes over."
 		if reason := s.mainMessageWaitingReason(t, msg); reason != "" {
 			r.Delivery, r.Reason = "waiting", reason
 		}
@@ -392,14 +392,10 @@ func (s *Server) routeMainMessage(ctx context.Context, t *Task, id int64) (*db.M
 	if route.Kind == "control" {
 		owner = "main"
 	}
-	// Preserve bounded direct analysis for completed/goalless tasks, with one
-	// owner. It never competes with Planner for the same message.
-	if route.Kind == "action" && route.OneOff && msg.InputSource == "main" {
-		state := t.lifecycleSnapshot()
-		open, openErr := t.Store.HasOpenGoal()
-		if openErr == nil && !open && !state.Paused && !state.Queued && !s.engine.IsPaused(t.ID) && !s.engine.isSettling(t.ID) {
-			owner = "main"
-		}
+	// Main records ordinary explicit requests before handing the same durable
+	// request to Planner. Existing goals do not remove Main's planning authority.
+	if route.Kind == "action" && msg.InputSource == "main" {
+		owner = "main"
 	}
 	decision, _ := json.Marshal(route)
 	msg, err = t.Store.FinishMainRouting(ctx, msg.ID, msg.RoutingToken, db.MainRouteDecision{
@@ -469,11 +465,10 @@ func (s *Server) mainMutationPolicy(t *Task, msg *db.MainMessage) agent.MainTurn
 	}
 	if msg.Route == "control" {
 		policy.Mode, policy.ControlTools = "control", decision.ControlTools
-	} else if msg.Route == "action" && decision.OneOff {
-		policy.Mode = "main_oneoff"
+	} else if msg.Route == "action" {
+		policy.Mode = "work_request"
 	}
 	var mutationMu sync.Mutex
-	var oneoffCalled bool
 	var lifecycleCalled bool
 	policy.Execute = func(ctx context.Context, tool string, input json.RawMessage, run func() (actool.Result, error)) (actool.Result, error) {
 		mutationMu.Lock()
@@ -500,16 +495,7 @@ func (s *Server) mainMutationPolicy(t *Task, msg *db.MainMessage) agent.MainTurn
 		if state.Paused || state.Queued || s.engine.IsPaused(t.ID) || s.engine.IsDeleting(t.ID) || s.engine.isSettling(t.ID) {
 			return actool.Errorf("Task lifecycle changed; the request remains saved and no action was started"), nil
 		}
-		if policy.Mode == "main_oneoff" {
-			if oneoffCalled {
-				return actool.Errorf("This message already attempted its one-off dispatch. Inspect existing work; do not duplicate it."), nil
-			}
-			open, err := t.Store.HasOpenGoal()
-			if err != nil || open {
-				return actool.Errorf("Task now has open goals; Main cannot bypass Planner"), nil
-			}
-			oneoffCalled = true
-		}
+
 		return run()
 	}
 	return policy
@@ -577,6 +563,11 @@ func (s *Server) runMainMessage(ctx context.Context, t *Task, msg *db.MainMessag
 	emit := func(rec db.Activity) { rec.MainSeg = &seg; s.engine.emitActivity(t, rec) }
 	gctx := intercept.WithTaskContext(ctx, t.ID, "mainagent", func(a db.Activity) { a.Worker = "mainagent"; emit(a) })
 	gctx = intercept.WithTargetScope(gctx, t.targetScope(intercept.DefaultTargetWaitBound))
+	gctx, requestErr := bindWorkRequests(gctx, t, []db.MainMessage{*msg})
+	if requestErr != nil {
+		emit(db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "Request ownership could not be loaded; the message remains saved."})
+		return
+	}
 	gctx = agent.WithMainTurnPolicy(gctx, s.mainMutationPolicy(t, msg))
 	gctx = agent.WithMainConversationReader(gctx, conversationReader(t, seg))
 	gctx = agent.WithInstructionStatusReader(gctx, s.instructionStatusReader(t, seg, msg.ID))
@@ -613,7 +604,26 @@ func (s *Server) runMainMessage(ctx context.Context, t *Task, msg *db.MainMessag
 	}
 	if msg.DeliveryOwner == "main" && msg.DeliveryStatus == "inflight" {
 		persist, stop := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		finishErr := t.Store.FinishMainDelivery(persist, msg.ID, msg.DeliveryToken, err == nil && healthyDelivery)
+		var finishErr error
+		request, readErr := t.Store.GetWorkRequest(persist, msg.ID)
+		if readErr != nil {
+			finishErr = readErr
+		} else if request != nil && err == nil && healthyDelivery && request.State != "completed" && request.State != "cancelled" {
+			finishErr = t.Store.HandoffMainRequest(persist, msg.ID, msg.DeliveryToken)
+			if finishErr == nil {
+				// The explicit action itself is durable work, including when Main
+				// did not manage to create a goal. Admit its Planner handoff using
+				// the same lifecycle checks as Main's ordinary graph mutations.
+				s.concMu.Lock()
+				if s.mainWaitingReason(t) == "" {
+					_, finishErr = s.admitTaskWhenLocked(t, "resume", false)
+				}
+				s.concMu.Unlock()
+				t.Notify()
+			}
+		} else {
+			finishErr = t.Store.FinishMainDelivery(persist, msg.ID, msg.DeliveryToken, err == nil && healthyDelivery)
+		}
 		stop()
 		if finishErr != nil {
 			emit(db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "Delivery receipt could not be saved; check existing effects before retrying."})
@@ -641,6 +651,7 @@ func (s *Server) runMainRoutingRecovery() {
 				continue
 			}
 			_ = t.Store.RecoverMainRouting(s.ctx)
+			_ = t.Store.MarkFinishedWorkRequestsForReview(s.ctx)
 			ids, err := t.Store.PendingMainRoutingIDs(s.ctx, 1)
 			if pending, readErr := t.Store.HasQueuedPlannerMessages(s.ctx); readErr == nil && pending && s.plannerWaitingReason(t) == "" {
 				t.Notify()

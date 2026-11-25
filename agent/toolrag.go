@@ -32,6 +32,7 @@ var toolRAGCore = map[string]bool{
 	"graph_overview": true, "node_detail": true, "add_intent": true, "steer_work": true,
 	"ask_operator": true, "prove_goal": true, "goal_met": true, "list_assets": true,
 	"save_artifact": true, "list_artifacts": true,
+	"list_work_requests": true, "attach_work_request_node": true, "resolve_work_request": true, "set_goals": true,
 }
 
 type toolQueryKey struct{}

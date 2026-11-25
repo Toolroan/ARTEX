@@ -99,7 +99,7 @@ func TestWriteArchiveRowsProducesJSONSequence(t *testing.T) {
 }
 
 func TestTaskArchiveFormatCompatibility(t *testing.T) {
-	for _, version := range []int{TaskArchiveLegacyFormatVersion, TaskArchiveFormatVersion} {
+	for version := TaskArchiveLegacyFormatVersion; version <= TaskArchiveFormatVersion; version++ {
 		if !IsTaskArchiveFormatSupported(version) {
 			t.Fatalf("archive format %d should be supported", version)
 		}
